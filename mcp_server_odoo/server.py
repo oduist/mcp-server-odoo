@@ -8,6 +8,7 @@ import contextlib
 from typing import Any, Dict, Optional
 
 from mcp.server import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from .access_control import AccessController
 from .config import OdooConfig, get_config
@@ -57,18 +58,62 @@ class OdooMCPServer:
         self.resource_handler = None
         self.tool_handler = None
 
-        # Create FastMCP instance with server metadata
-        self.app = FastMCP(
+        # OAuth provider (created when auth_token + server_url are set)
+        self._oauth_provider = None
+
+        # Build FastMCP constructor kwargs
+        fastmcp_kwargs: Dict[str, Any] = dict(
             name="odoo-mcp-server",
             instructions="MCP server for accessing and managing Odoo ERP data through the Model Context Protocol",
             lifespan=self._odoo_lifespan,
         )
+
+        # Enable OAuth when both auth_token and server_url are configured
+        if (
+            self.config.auth_token
+            and self.config.server_url
+            and self.config.transport == "streamable-http"
+        ):
+            from mcp.server.auth.settings import (
+                AuthSettings,
+                ClientRegistrationOptions,
+                RevocationOptions,
+            )
+
+            from .oauth_provider import OdooOAuthProvider
+
+            self._oauth_provider = OdooOAuthProvider(
+                server_url=self.config.server_url,
+                auth_token=self.config.auth_token,
+            )
+            fastmcp_kwargs.update(
+                auth_server_provider=self._oauth_provider,
+                auth=AuthSettings(
+                    issuer_url=self.config.server_url,
+                    resource_server_url=self.config.server_url,
+                    client_registration_options=ClientRegistrationOptions(
+                        enabled=True,
+                        valid_scopes=["odoo"],
+                        default_scopes=["odoo"],
+                    ),
+                    revocation_options=RevocationOptions(enabled=True),
+                    required_scopes=[],
+                ),
+            )
+            logger.info("OAuth authorization server enabled")
+
+        # Create FastMCP instance
+        self.app = FastMCP(**fastmcp_kwargs)
 
         @self.app.custom_route("/health", methods=["GET"])
         async def health_check(request):
             from starlette.responses import JSONResponse
 
             return JSONResponse(self.get_health_status())
+
+        # Register OAuth consent page when OAuth is enabled
+        if self._oauth_provider:
+            self._register_consent_route()
 
         @self.app.completion()
         async def handle_completion(ref, argument, context):
@@ -90,9 +135,16 @@ class OdooMCPServer:
     async def _odoo_lifespan(self, app: FastMCP):
         """Manage Odoo connection lifecycle for FastMCP.
 
-        Sets up connection, registers resources/tools before server starts.
-        Cleans up connection when server stops.
+        In stdio mode this runs once per process.  In HTTP mode the MCP SDK
+        invokes the lifespan **per session**, so we only set up the
+        connection on first entry and never tear it down until the process
+        exits (see ``run_http``).
         """
+        if self.connection and self.connection.is_authenticated:
+            # Connection already established (HTTP mode) — reuse it.
+            yield {}
+            return
+
         try:
             with perf_logger.track_operation("server_startup"):
                 self._ensure_connection()
@@ -170,6 +222,52 @@ class OdooMCPServer:
             )
             logger.info("Registered MCP tools")
 
+    def _register_consent_route(self):
+        """Register the OAuth consent page as a custom route."""
+
+        @self.app.custom_route("/oauth/consent", methods=["GET", "POST"])
+        async def oauth_consent(request):
+            import hmac
+
+            from starlette.responses import HTMLResponse, RedirectResponse
+
+            provider = self._oauth_provider
+            if not provider:
+                return HTMLResponse("OAuth not configured", status_code=500)
+
+            if request.method == "GET":
+                request_id = request.query_params.get("request_id", "")
+                client_id = request.query_params.get("client_id", "")
+                error = request.query_params.get("error", "")
+                return HTMLResponse(_consent_page_html(request_id, client_id, error))
+
+            # POST — validate token from form
+            form = await request.form()
+            request_id = form.get("request_id", "")
+            client_id = form.get("client_id", "")
+            token = form.get("token", "")
+
+            if not hmac.compare_digest(str(token), provider.auth_token):
+                # Wrong token — show form again with error
+                from urllib.parse import urlencode
+
+                qs = urlencode(
+                    {"request_id": request_id, "client_id": client_id, "error": "1"}
+                )
+                return RedirectResponse(
+                    f"/oauth/consent?{qs}", status_code=303
+                )
+
+            try:
+                redirect_url = provider.complete_authorization(
+                    str(request_id), str(client_id)
+                )
+                return RedirectResponse(redirect_url, status_code=303)
+            except KeyError:
+                return HTMLResponse(
+                    "Authorization request expired or invalid.", status_code=400
+                )
+
     async def run_stdio(self):
         """Run the server using stdio transport."""
         try:
@@ -198,15 +296,66 @@ class OdooMCPServer:
     async def run_http(self, host: str = "localhost", port: int = 8000):
         """Run the server using streamable HTTP transport.
 
+        When ``ODOO_MCP_AUTH_TOKEN`` is set, every HTTP request must include
+        an ``Authorization: Bearer <token>`` header matching the configured
+        value.  Requests without a valid token receive a 401 response.
+
         Args:
             host: Host to bind to
             port: Port to bind to
         """
+        import uvicorn
+
         try:
             logger.info(f"Starting MCP server with HTTP transport on {host}:{port}...")
+
+            # Establish Odoo connection once, before the HTTP server starts.
+            # The per-session lifespan will reuse this connection.
+            with perf_logger.track_operation("server_startup"):
+                self._ensure_connection()
+                self._register_resources()
+                self._register_tools()
+
             self.app.settings.host = host
             self.app.settings.port = port
-            await self.app.run_streamable_http_async()
+
+            # Disable DNS rebinding protection — the server typically sits
+            # behind a reverse proxy (Traefik, nginx) that handles TLS and
+            # Host validation.  The SDK auto-enables it for localhost, but
+            # that breaks when the external Host header differs.
+            self.app.settings.transport_security = TransportSecuritySettings(
+                enable_dns_rebinding_protection=False,
+            )
+
+            starlette_app = self.app.streamable_http_app()
+
+            if self._oauth_provider:
+                # OAuth handles auth via the SDK's built-in middleware.
+                logger.info("HTTP authentication via OAuth")
+            elif self.config.auth_token:
+                from .http_auth import BearerTokenMiddleware
+
+                starlette_app = BearerTokenMiddleware(
+                    starlette_app, token=self.config.auth_token
+                )
+                logger.info("HTTP Bearer token authentication enabled")
+            else:
+                logger.warning(
+                    "No ODOO_MCP_AUTH_TOKEN set — HTTP server accepts "
+                    "unauthenticated connections"
+                )
+
+            config = uvicorn.Config(
+                starlette_app,
+                host=host,
+                port=port,
+                log_level=self.config.log_level.lower(),
+            )
+            server = uvicorn.Server(config)
+            try:
+                await server.serve()
+            finally:
+                self._cleanup_connection()
         except KeyboardInterrupt:
             logger.info("Server interrupted by user")
         except (OdooConnectionError, ConfigurationError):
@@ -261,3 +410,52 @@ class OdooMCPServer:
         except Exception as e:
             logger.debug(f"Failed to get model names for autocomplete: {e}")
             return []
+
+
+def _consent_page_html(request_id: str, client_id: str, error: str = "") -> str:
+    """Return the HTML for the OAuth consent page."""
+    error_html = (
+        '<p style="color:#c0392b;font-weight:bold">Invalid token. Please try again.</p>'
+        if error
+        else ""
+    )
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Odoo MCP Server — Authorize</title>
+<style>
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         display: flex; align-items: center; justify-content: center;
+         min-height: 100vh; margin: 0; background: #f5f6fa; }}
+  .card {{ background: #fff; padding: 2rem; border-radius: 12px;
+           box-shadow: 0 2px 12px rgba(0,0,0,.08); max-width: 400px; width: 100%; }}
+  h1 {{ font-size: 1.3rem; margin: 0 0 .5rem; }}
+  p {{ color: #555; font-size: .9rem; line-height: 1.5; }}
+  label {{ display: block; font-weight: 600; margin-top: 1rem; font-size: .9rem; }}
+  input[type=password] {{ width: 100%; padding: .6rem; margin-top: .3rem;
+         border: 1px solid #ddd; border-radius: 6px; font-size: 1rem; box-sizing: border-box; }}
+  button {{ margin-top: 1.2rem; width: 100%; padding: .7rem; background: #7c3aed;
+            color: #fff; border: none; border-radius: 6px; font-size: 1rem;
+            cursor: pointer; }}
+  button:hover {{ background: #6d28d9; }}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Odoo MCP Server</h1>
+  <p>An application is requesting access to your Odoo MCP server.
+     Enter the server access token to authorize.</p>
+  {error_html}
+  <form method="post" action="/oauth/consent">
+    <input type="hidden" name="request_id" value="{request_id}">
+    <input type="hidden" name="client_id" value="{client_id}">
+    <label for="token">Access Token</label>
+    <input type="password" id="token" name="token" required autofocus
+           placeholder="Enter ODOO_MCP_AUTH_TOKEN">
+    <button type="submit">Authorize</button>
+  </form>
+</div>
+</body>
+</html>"""

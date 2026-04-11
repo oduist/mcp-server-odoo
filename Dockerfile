@@ -16,6 +16,8 @@ COPY --from=builder --chown=mcp:mcp /usr/local/bin/mcp-server-odoo /usr/local/bi
 
 ENV PYTHONUNBUFFERED=1
 
+EXPOSE 8000
+
 LABEL org.opencontainers.image.title="mcp-server-odoo"
 LABEL org.opencontainers.image.description="MCP Server for Odoo ERP — connect AI assistants to Odoo via XML-RPC"
 LABEL org.opencontainers.image.url="https://github.com/ivnvxd/mcp-server-odoo"
@@ -25,3 +27,4 @@ LABEL org.opencontainers.image.licenses="MPL-2.0"
 USER mcp
 
 ENTRYPOINT ["mcp-server-odoo"]
+CMD ["--transport", "streamable-http", "--host", "0.0.0.0"]

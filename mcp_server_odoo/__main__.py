@@ -54,6 +54,8 @@ Optional environment variables:
   ODOO_MCP_TRANSPORT       Transport type: stdio or streamable-http (default: stdio)
   ODOO_MCP_HOST            Server host for HTTP transports (default: localhost)
   ODOO_MCP_PORT            Server port for HTTP transports (default: 8000)
+  ODOO_MCP_AUTH_TOKEN      Bearer token for HTTP client authentication
+  ODOO_MCP_SERVER_URL      Public URL of this MCP server (required for OAuth)
 
 For more information, visit: https://github.com/ivnvxd/mcp-server-odoo""",
     )

@@ -36,6 +36,8 @@ class OdooConfig:
     transport: Literal["stdio", "streamable-http"] = "stdio"
     host: str = "localhost"
     port: int = 8000
+    auth_token: Optional[str] = None  # Bearer token for HTTP transport auth
+    server_url: Optional[str] = None  # Public URL of this MCP server (for OAuth metadata)
 
     # YOLO mode configuration
     yolo_mode: str = "off"  # "off", "read", or "true"
@@ -102,6 +104,16 @@ class OdooConfig:
         # Validate port
         if self.port <= 0 or self.port > 65535:
             raise ValueError("Port must be between 1 and 65535")
+
+        # Warn if HTTP transport without auth token
+        if self.transport == "streamable-http" and not self.auth_token:
+            import warnings
+
+            warnings.warn(
+                "Running HTTP transport without ODOO_MCP_AUTH_TOKEN. "
+                "The server will accept unauthenticated connections.",
+                stacklevel=2,
+            )
 
     @property
     def uses_api_key(self) -> bool:
@@ -232,6 +244,8 @@ def load_config(env_file: Optional[Path] = None) -> OdooConfig:
         transport=os.getenv("ODOO_MCP_TRANSPORT", "stdio").strip(),
         host=os.getenv("ODOO_MCP_HOST", "localhost").strip(),
         port=get_int_env("ODOO_MCP_PORT", 8000),
+        auth_token=os.getenv("ODOO_MCP_AUTH_TOKEN", "").strip() or None,
+        server_url=os.getenv("ODOO_MCP_SERVER_URL", "").strip() or None,
         locale=os.getenv("ODOO_LOCALE", "").strip() or None,
         yolo_mode=get_yolo_mode(),
     )
