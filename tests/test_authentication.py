@@ -14,8 +14,6 @@ import pytest
 from mcp_server_odoo.config import OdooConfig
 from mcp_server_odoo.odoo_connection import OdooConnection, OdooConnectionError
 
-from .conftest import ODOO_SERVER_AVAILABLE
-
 
 class TestAuthentication:
     """Test authentication functionality."""
@@ -174,13 +172,21 @@ class TestAuthentication:
         assert conn.uid == 3
         assert conn.auth_method == "password"
 
-    def test_authenticate_with_auto_database(self, connection_api_key):
+    def test_authenticate_with_auto_database(self):
         """Test authentication with automatic database selection."""
-        # Mock database list to return the configured database
+        # No database configured — authentication must auto-select from the
+        # server's database list (independent of the ODOO_DB env var)
+        config = OdooConfig(
+            url=os.getenv("ODOO_URL", "http://localhost:8069"),
+            api_key="test_api_key",
+            database=None,
+        )
+        conn = OdooConnection(config)
+        conn._connected = True
+
         mock_db = Mock()
-        db_name = os.getenv("ODOO_DB")
-        mock_db.list.return_value = [db_name]
-        connection_api_key._db_proxy = mock_db
+        mock_db.list.return_value = ["auto_selected_db"]
+        conn._db_proxy = mock_db
 
         # Mock API key auth
         with patch("urllib.request.urlopen") as mock_urlopen:
@@ -191,9 +197,9 @@ class TestAuthentication:
             mock_urlopen.return_value.__enter__.return_value = mock_response
 
             # Authenticate without specifying database
-            connection_api_key.authenticate()
+            conn.authenticate()
 
-            assert connection_api_key.database == db_name
+            assert conn.database == "auto_selected_db"
 
     def test_authentication_state_cleared_on_disconnect(self, connection_api_key):
         """Test authentication state is cleared on disconnect."""
@@ -312,7 +318,6 @@ class TestAuthenticateOrchestration:
             conn.authenticate("testdb")
 
 
-@pytest.mark.skipif(not ODOO_SERVER_AVAILABLE, reason="Odoo server not available")
 class TestAuthenticationIntegration:
     """Integration tests with real Odoo server."""
 

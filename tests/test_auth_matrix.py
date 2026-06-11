@@ -19,15 +19,6 @@ from mcp_server_odoo.access_control import AccessControlError, AccessController
 from mcp_server_odoo.config import OdooConfig
 from mcp_server_odoo.odoo_connection import OdooConnection
 
-from .conftest import ODOO_SERVER_AVAILABLE
-
-
-@pytest.fixture(autouse=True)
-def _rate_limit_delay():
-    """Placeholder — rate limiting not needed for local Odoo."""
-    yield
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -222,7 +213,6 @@ STANDARD_SCENARIOS = [
 ]
 
 
-@pytest.mark.skipif(not ODOO_SERVER_AVAILABLE, reason="Odoo server not available")
 @pytest.mark.mcp
 class TestStandardAuthMatrix:
     """S1–S6: Standard mode auth scenarios against live Odoo + MCP module."""
@@ -268,7 +258,6 @@ class TestStandardAuthMatrix:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not ODOO_SERVER_AVAILABLE, reason="Odoo server not available")
 @pytest.mark.mcp
 class TestStandardRestrictedOps:
     """Standard mode: verify MCP module denies restricted operations.
@@ -395,7 +384,6 @@ YOLO_READ_SCENARIOS = [
 ]
 
 
-@pytest.mark.skipif(not ODOO_SERVER_AVAILABLE, reason="Odoo server not available")
 @pytest.mark.yolo
 class TestYoloReadAuthMatrix:
     """Y1–Y5: YOLO read mode auth scenarios."""
@@ -517,7 +505,6 @@ YOLO_FULL_SCENARIOS = [
 ]
 
 
-@pytest.mark.skipif(not ODOO_SERVER_AVAILABLE, reason="Odoo server not available")
 @pytest.mark.yolo
 class TestYoloFullAuthMatrix:
     """F1–F5: YOLO full mode auth scenarios."""

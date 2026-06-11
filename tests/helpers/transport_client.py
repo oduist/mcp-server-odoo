@@ -40,7 +40,9 @@ class StdioTransportTester(TransportTestBase):
                 ["python", "-m", "mcp_server_odoo"],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                # stderr is never read; PIPE would wedge the server once the
+                # buffer fills (e.g. with DEBUG logging enabled)
+                stderr=subprocess.DEVNULL,
                 text=True,
                 bufsize=0,
             )
@@ -146,8 +148,10 @@ class HttpTransportTester(TransportTestBase):
                     "--port",
                     str(port),
                 ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                # Output is never read; PIPE would wedge the server once the
+                # buffer fills (e.g. with DEBUG logging enabled)
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
 
             # Poll until the server accepts connections instead of a fixed sleep

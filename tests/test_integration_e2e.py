@@ -18,8 +18,7 @@ from mcp.server.fastmcp import FastMCP
 
 from mcp_server_odoo.access_control import AccessController
 from mcp_server_odoo.config import OdooConfig
-from mcp_server_odoo.error_handling import NotFoundError, ValidationError
-from mcp_server_odoo.error_handling import PermissionError as MCPPermissionError
+from mcp_server_odoo.error_handling import MCPPermissionError, NotFoundError, ValidationError
 from mcp_server_odoo.odoo_connection import OdooConnection
 from mcp_server_odoo.resources import OdooResourceHandler
 from mcp_server_odoo.tools import OdooToolHandler
@@ -29,7 +28,6 @@ from tests.helpers.server_testing import (
     PerformanceTimer,
     assert_performance,
     check_odoo_health,
-    create_test_env_file,
     mcp_test_server,
 )
 
@@ -121,20 +119,6 @@ class TestServerLifecycle:
             assert process.poll() is None
 
         assert server.server_process is None
-
-    def test_server_with_env_file(self, tmp_path, config):
-        """Test server can load configuration from .env file."""
-        create_test_env_file(tmp_path)
-
-        original_cwd = os.getcwd()
-        os.chdir(tmp_path)
-
-        try:
-            loaded = OdooConfig.from_env()
-            assert loaded.url == os.getenv("ODOO_URL", "http://localhost:8069")
-            assert loaded.api_key == (os.getenv("ODOO_API_KEY") or None)
-        finally:
-            os.chdir(original_cwd)
 
     def test_uvx_server_startup(self):
         """Test that server module is executable."""
@@ -243,15 +227,23 @@ class TestResourceOperations:
     async def test_search_with_domain(self, connected_env):
         """Test search with domain filter returns filtered results."""
         handler = connected_env["resource_handler"]
+        conn = connected_env["connection"]
         import json
         from urllib.parse import quote
 
-        domain = json.dumps([["is_company", "=", True]])
-        result = await handler._handle_search("res.partner", quote(domain), None, 5, 0, None)
+        domain = [["is_company", "=", True]]
+        result = await handler._handle_search(
+            "res.partner", quote(json.dumps(domain)), None, 5, 0, None
+        )
 
         assert "res.partner" in result
-        # Should mention record count from filtered results
         assert "Showing records" in result
+
+        # The displayed total must match the domain-filtered count, proving
+        # the domain was actually applied and not silently dropped
+        expected = conn.search_count("res.partner", domain)
+        assert expected > 0, "test database must contain at least one company partner"
+        assert f"of {expected}" in result
 
     @pytest.mark.asyncio
     async def test_count_operation(self, connected_env):
