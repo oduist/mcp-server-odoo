@@ -952,3 +952,34 @@ class TestTransportSecurity:
             # Verify FastMCP was called with transport_security=None
             call_kwargs = mock_fastmcp.call_args[1]
             assert call_kwargs.get("transport_security") is None
+
+    def test_build_transport_security_returns_none_without_hosts(self):
+        """Empty allowed_hosts → None, leaving the SDK default (protection off)."""
+        server = OdooMCPServer(
+            OdooConfig(url="http://localhost:8069", api_key="k", allowed_hosts=[])
+        )
+        assert server._build_transport_security() is None
+
+    def test_build_transport_security_settings_shape(self):
+        """Configured hosts produce wildcard-port hosts and http/https origins;
+        a host that already carries a port keeps it verbatim."""
+        server = OdooMCPServer(
+            OdooConfig(
+                url="http://localhost:8069",
+                api_key="k",
+                allowed_hosts=["odoo.example.com", "localhost:9000"],
+            )
+        )
+        settings = server._build_transport_security()
+
+        assert settings is not None
+        assert settings.enable_dns_rebinding_protection is True
+        # bare host gets :*, host:port is preserved as-is
+        assert settings.allowed_hosts == ["odoo.example.com:*", "localhost:9000"]
+        # origins use the base hostname (port stripped) on both schemes
+        assert settings.allowed_origins == [
+            "http://odoo.example.com:*",
+            "https://odoo.example.com:*",
+            "http://localhost:*",
+            "https://localhost:*",
+        ]
