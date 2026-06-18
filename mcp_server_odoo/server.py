@@ -4,12 +4,14 @@ This module provides the FastMCP server that exposes Odoo data
 and functionality through the Model Context Protocol.
 """
 
+import asyncio
 import contextlib
 from typing import Any, Dict, Optional
 
 from mcp.server import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
 
+from . import __version__
 from .access_control import AccessController
 from .config import OdooConfig, get_config
 from .error_handling import (
@@ -26,8 +28,8 @@ from .tools import register_tools
 # Set up logging
 logger = get_logger(__name__)
 
-# Server version
-SERVER_VERSION = "0.5.0"
+# Server version — single-sourced from the package
+SERVER_VERSION = __version__
 
 
 class OdooMCPServer:
@@ -48,8 +50,8 @@ class OdooMCPServer:
         # Load configuration
         self.config = config or get_config()
 
-        # Set up structured logging
-        logging_config.setup()
+        # Set up structured logging with the validated config level
+        logging_config.setup(log_level=self.config.log_level)
 
         # Initialize connection and access controller (will be created on startup)
         self.connection: Optional[OdooConnection] = None
@@ -61,11 +63,23 @@ class OdooMCPServer:
         # OAuth provider (created when auth_token + server_url are set)
         self._oauth_provider = None
 
+        # Serializes connection setup/reauth across concurrent lifespan
+        # entries (streamable-http enters the lifespan per session)
+        self._connect_lock = asyncio.Lock()
+
+        # Configure transport security for DNS rebinding protection. Left as
+        # None (no allowed_hosts configured) the SDK middleware defaults to
+        # protection DISABLED — preserving prior behavior for stdio and for
+        # HTTP deployments that don't set ODOO_MCP_ALLOWED_HOSTS.
+        transport_security = self._build_transport_security()
+
         # Build FastMCP constructor kwargs
         fastmcp_kwargs: Dict[str, Any] = dict(
             name="odoo-mcp-server",
             instructions="MCP server for accessing and managing Odoo ERP data through the Model Context Protocol",
             lifespan=self._odoo_lifespan,
+            host=self.config.host,
+            transport_security=transport_security,
         )
 
         # Enable OAuth when both auth_token and server_url are configured
@@ -120,7 +134,7 @@ class OdooMCPServer:
             from mcp.types import Completion
 
             if argument.name == "model":
-                model_names = self._get_model_names()
+                model_names = await asyncio.to_thread(self._get_model_names)
                 partial = argument.value or ""
                 if partial:
                     matches = [m for m in model_names if partial.lower() in m.lower()]
@@ -135,10 +149,15 @@ class OdooMCPServer:
     async def _odoo_lifespan(self, app: FastMCP):
         """Manage Odoo connection lifecycle for FastMCP.
 
-        In stdio mode this runs once per process.  In HTTP mode the MCP SDK
-        invokes the lifespan **per session**, so we only set up the
-        connection on first entry and never tear it down until the process
-        exits (see ``run_http``).
+        Sets up connection, registers resources/tools before serving.
+
+        The low-level MCP server enters this context PER SESSION. Under
+        stdio there is exactly one session per process, so cleaning up on
+        exit is correct. Under streamable-http every client session (and
+        every ``DELETE /mcp``) exits and re-enters it — tearing down the
+        authenticated Odoo connection there broke every call after the
+        first (#70). The connection must persist across HTTP sessions;
+        the OS reclaims it at process exit.
         """
         if self.connection and self.connection.is_authenticated:
             # Connection already established (HTTP mode) — reuse it.
@@ -147,20 +166,63 @@ class OdooMCPServer:
 
         try:
             with perf_logger.track_operation("server_startup"):
-                self._ensure_connection()
+                # Connection setup is sync XML-RPC/urllib I/O (up to the
+                # socket timeout) — keep it off the event loop. The lock
+                # preserves the serialization that running on the loop's
+                # single thread used to provide.
+                async with self._connect_lock:
+                    await asyncio.to_thread(self._ensure_connection)
                 self._register_resources()
                 self._register_tools()
             yield {}
         finally:
-            self._cleanup_connection()
+            if self.config.transport != "streamable-http":
+                self._cleanup_connection()
 
     def _ensure_connection(self):
         """Ensure connection to Odoo is established.
+
+        Reuses an existing authenticated connection (streamable-http
+        re-enters the lifespan per session — see ``_odoo_lifespan``).
 
         Raises:
             ConnectionError: If connection fails
             ConfigurationError: If configuration is invalid
         """
+        if self.connection and self.connection.is_authenticated:
+            logger.info("Reusing existing authenticated Odoo connection")
+            return
+        if self.connection:
+            # Reconnect the existing object IN PLACE: registered tool and
+            # resource handlers hold references to this connection, so it
+            # must never be replaced with a new instance.
+            logger.warning("Existing connection is not authenticated; reconnecting")
+            try:
+                with perf_logger.track_operation("connection_reauth"):
+                    if not self.connection.is_connected:
+                        self.connection.connect()
+                    self.connection.authenticate()
+                # Reauth re-runs the api-key→password fallback chain, so the
+                # effective auth method may differ from the initial connect.
+                # The controller may not exist at all if the first startup
+                # failed after self.connection was assigned but before auth
+                # succeeded — without it, handler registration silently skips.
+                if self.access_controller is None:
+                    self.access_controller = AccessController(
+                        self.config,
+                        database=self.connection.database,
+                        auth_method=self.connection.auth_method,
+                    )
+                else:
+                    self.access_controller.auth_method = self.connection.auth_method
+                return
+            except Exception as e:
+                context = ErrorContext(operation="connection_reauth")
+                if isinstance(e, (OdooConnectionError, ConfigurationError)):
+                    raise
+                # handle_error reraises (reraise defaults to True) — reauth
+                # failures always propagate to the session
+                error_handler.handle_error(e, context=context)
         if not self.connection:
             try:
                 logger.info("Establishing connection to Odoo...")
@@ -179,9 +241,13 @@ class OdooMCPServer:
 
                 logger.info(f"Successfully connected to Odoo at {self.config.url}")
 
-                # Initialize access controller (pass resolved DB for session auth)
+                # Initialize access controller (pass resolved DB for session
+                # auth and the EFFECTIVE auth method — after a password
+                # fallback, permission checks must not send the rejected key)
                 self.access_controller = AccessController(
-                    self.config, database=self.connection.database
+                    self.config,
+                    database=self.connection.database,
+                    auth_method=self.connection.auth_method,
                 )
             except Exception as e:
                 context = ErrorContext(operation="connection_setup")
@@ -207,7 +273,14 @@ class OdooMCPServer:
                 self.tool_handler = None
 
     def _register_resources(self):
-        """Register resource handlers after connection is established."""
+        """Register resource handlers after connection is established.
+
+        Idempotent: streamable-http re-enters the lifespan per session and
+        handlers must not be registered twice on the shared FastMCP app.
+        """
+        if self.resource_handler is not None:
+            logger.debug("Resources already registered, skipping")
+            return
         if self.connection and self.access_controller:
             self.resource_handler = register_resources(
                 self.app, self.connection, self.access_controller, self.config
@@ -215,7 +288,13 @@ class OdooMCPServer:
             logger.info("Registered MCP resources")
 
     def _register_tools(self):
-        """Register tool handlers after connection is established."""
+        """Register tool handlers after connection is established.
+
+        Idempotent — see ``_register_resources``.
+        """
+        if self.tool_handler is not None:
+            logger.debug("Tools already registered, skipping")
+            return
         if self.connection and self.access_controller:
             self.tool_handler = register_tools(
                 self.app, self.connection, self.access_controller, self.config
@@ -251,22 +330,14 @@ class OdooMCPServer:
                 # Wrong token — show form again with error
                 from urllib.parse import urlencode
 
-                qs = urlencode(
-                    {"request_id": request_id, "client_id": client_id, "error": "1"}
-                )
-                return RedirectResponse(
-                    f"/oauth/consent?{qs}", status_code=303
-                )
+                qs = urlencode({"request_id": request_id, "client_id": client_id, "error": "1"})
+                return RedirectResponse(f"/oauth/consent?{qs}", status_code=303)
 
             try:
-                redirect_url = provider.complete_authorization(
-                    str(request_id), str(client_id)
-                )
+                redirect_url = provider.complete_authorization(str(request_id), str(client_id))
                 return RedirectResponse(redirect_url, status_code=303)
             except KeyError:
-                return HTMLResponse(
-                    "Authorization request expired or invalid.", status_code=400
-                )
+                return HTMLResponse("Authorization request expired or invalid.", status_code=400)
 
     async def run_stdio(self):
         """Run the server using stdio transport."""
@@ -319,13 +390,11 @@ class OdooMCPServer:
             self.app.settings.host = host
             self.app.settings.port = port
 
-            # Disable DNS rebinding protection — the server typically sits
-            # behind a reverse proxy (Traefik, nginx) that handles TLS and
-            # Host validation.  The SDK auto-enables it for localhost, but
-            # that breaks when the external Host header differs.
-            self.app.settings.transport_security = TransportSecuritySettings(
-                enable_dns_rebinding_protection=False,
-            )
+            # Apply ODOO_MCP_SESSION_IDLE_TIMEOUT before streamable_http_app()
+            # lazily builds the session manager below. DNS rebinding protection
+            # is configured at construction via _build_transport_security()
+            # (disabled by default, opt-in through ODOO_MCP_ALLOWED_HOSTS).
+            self._preseed_session_manager()
 
             starlette_app = self.app.streamable_http_app()
 
@@ -335,15 +404,11 @@ class OdooMCPServer:
             elif self.config.auth_token:
                 from .http_auth import BearerTokenMiddleware
 
-                starlette_app = BearerTokenMiddleware(
-                    starlette_app, token=self.config.auth_token
-                )
+                starlette_app = BearerTokenMiddleware(starlette_app, token=self.config.auth_token)
                 logger.info("HTTP Bearer token authentication enabled")
             else:
-                logger.warning(
-                    "No ODOO_MCP_AUTH_TOKEN set — HTTP server accepts "
-                    "unauthenticated connections"
-                )
+                # No built-in client auth — warn loudly if bound non-loopback.
+                self._warn_if_exposed(host)
 
             config = uvicorn.Config(
                 starlette_app,
@@ -364,6 +429,87 @@ class OdooMCPServer:
             context = ErrorContext(operation="server_run_http")
             error_handler.handle_error(e, context=context)
 
+    def _preseed_session_manager(self) -> None:
+        """Apply ODOO_MCP_SESSION_IDLE_TIMEOUT to the streamable-http transport.
+
+        The SDK's StreamableHTTPSessionManager supports evicting idle sessions
+        (freeing their transport state, which otherwise accumulates until
+        process restart), but FastMCP does not yet expose the parameter. Its session manager is created lazily in
+        streamable_http_app(), so constructing it here first — mirroring the
+        arguments FastMCP would pass, plus the timeout — makes FastMCP reuse
+        this instance. Remove once FastMCP plumbs session_idle_timeout through.
+        """
+        if self.config.session_idle_timeout is None:
+            return
+
+        from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+        self.app._session_manager = StreamableHTTPSessionManager(
+            app=self.app._mcp_server,
+            event_store=self.app._event_store,
+            retry_interval=self.app._retry_interval,
+            json_response=self.app.settings.json_response,
+            stateless=self.app.settings.stateless_http,
+            security_settings=self.app.settings.transport_security,
+            session_idle_timeout=self.config.session_idle_timeout,
+        )
+        logger.info(
+            "Streamable-http session idle timeout enabled: %.0fs",
+            self.config.session_idle_timeout,
+        )
+
+    def _build_transport_security(self) -> Optional[TransportSecuritySettings]:
+        """Build DNS-rebinding-protection settings from ODOO_MCP_ALLOWED_HOSTS.
+
+        Returns None when no hosts are configured, which leaves the SDK
+        middleware at its default (protection disabled) — unchanged behavior
+        for stdio and for HTTP deployments behind a proxy that don't set the
+        variable. When hosts are configured, each is allowed on any port and
+        matching http/https origins are derived.
+        """
+        if not self.config.allowed_hosts:
+            return None
+
+        allowed_hosts: list[str] = []
+        allowed_origins: list[str] = []
+        for host in self.config.allowed_hosts:
+            base = host.split(":")[0] if ":" in host else host
+            allowed_hosts.append(host if ":" in host else f"{host}:*")
+            allowed_origins.extend([f"http://{base}:*", f"https://{base}:*"])
+
+        return TransportSecuritySettings(
+            enable_dns_rebinding_protection=True,
+            allowed_hosts=allowed_hosts,
+            allowed_origins=allowed_origins,
+        )
+
+    def _warn_if_exposed(self, host: str) -> None:
+        """Warn loudly when the HTTP transport binds a non-loopback host.
+
+        The streamable-http transport has NO built-in client authentication:
+        anyone who can reach the port gets Odoo access through the server's
+        stored credentials. Remote deployments must front it with a reverse
+        proxy that enforces authentication.
+        """
+        if host in ("localhost", "127.0.0.1", "::1"):
+            return
+
+        message = (
+            f"HTTP transport binding to '{host}' — this transport has NO built-in "
+            "authentication. Anyone who can reach this port gets Odoo access with "
+            "the server's stored credentials. Bind to localhost or front this "
+            "server with an authenticating reverse proxy."
+        )
+        if self.config.yolo_mode == "true":
+            message += (
+                " YOLO FULL-ACCESS MODE IS ENABLED: unauthenticated clients could "
+                "read, write and delete ANY record"
+            )
+            if self.config.enable_method_calls:
+                message += " and call arbitrary model methods"
+            message += "."
+        logger.warning(message)
+
     def get_capabilities(self) -> Dict[str, Dict[str, bool]]:
         """Get server capabilities.
 
@@ -379,10 +525,10 @@ class OdooMCPServer:
         }
 
     def get_health_status(self) -> Dict[str, Any]:
-        """Get server health status with error metrics.
+        """Get server health status.
 
         Returns:
-            Dict with health status and metrics
+            Dict with health status
         """
         is_connected = bool(self.connection is not None and self.connection.is_authenticated)
 

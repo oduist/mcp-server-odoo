@@ -9,9 +9,6 @@ from mcp_server_odoo.config import OdooConfig, load_config
 from mcp_server_odoo.odoo_connection import OdooConnection
 from mcp_server_odoo.performance import PerformanceManager
 
-# Import skip_on_rate_limit decorator
-from .test_xmlrpc_operations import skip_on_rate_limit
-
 
 class TestOdooConnectionCaching:
     """Test caching functionality in OdooConnection."""
@@ -183,58 +180,32 @@ class TestCachingIntegration:
 
     @pytest.mark.mcp
     def test_real_read_bypasses_cache(self, real_config, performance_manager):
-        """Test read always returns fresh data from Odoo (no record caching)."""
+        """read() always returns fresh server data: a write between two reads
+        must be visible in the second read (no record caching)."""
         conn = OdooConnection(real_config, performance_manager=performance_manager)
+        company_id = None
 
         try:
             conn.connect()
             conn.authenticate()
 
-            # Get some partner IDs
-            partner_ids = conn.search("res.partner", [], limit=5)
+            # res.company has full CRUD enabled on the test instance
+            company_id = conn.create("res.company", {"name": "Cache Bypass Test Co"})
 
-            if partner_ids:
-                # Two consecutive reads should both return data
-                records1 = conn.read("res.partner", partner_ids[:2], ["name", "email", "phone"])
-                records2 = conn.read("res.partner", partner_ids[:2], ["name", "email", "phone"])
+            records1 = conn.read("res.company", [company_id], ["name"])
+            assert records1[0]["name"] == "Cache Bypass Test Co"
 
-                assert len(records1) == 2
-                assert len(records2) == 2
-                assert records1 == records2
+            conn.write("res.company", [company_id], {"name": "Cache Bypass Test Co v2"})
+
+            records2 = conn.read("res.company", [company_id], ["name"])
+            assert records2[0]["name"] == "Cache Bypass Test Co v2", (
+                "second read returned stale data — read() must not serve cached records"
+            )
 
         finally:
+            if company_id:
+                try:
+                    conn.unlink("res.company", [company_id])
+                except Exception:
+                    pass
             conn.disconnect()
-
-    @pytest.mark.mcp
-    @skip_on_rate_limit
-    def test_connection_pool_reuse(self, real_config, performance_manager):
-        """Test connection pooling improves performance."""
-        # Create two connections sharing same performance manager
-        conn1 = OdooConnection(real_config, performance_manager=performance_manager)
-        conn2 = OdooConnection(real_config, performance_manager=performance_manager)
-
-        try:
-            # Connect both
-            conn1.connect()
-            conn1.authenticate()
-            conn2.connect()
-            conn2.authenticate()
-
-            # They should be reusing connections from pool
-            pool_stats = performance_manager.connection_pool.get_stats()
-
-            # Should have created and reused connections
-            assert pool_stats["connections_created"] >= 1
-            assert pool_stats["connections_reused"] > 0
-
-            # Do some operations
-            conn1.fields_get("res.partner")
-            conn2.fields_get("res.partner")  # Use same model to avoid permission issue
-
-            # Check pool is being used effectively
-            pool_stats = performance_manager.connection_pool.get_stats()
-            assert pool_stats["active_connections"] <= 6  # 3 endpoints * 2 connections max
-
-        finally:
-            conn1.disconnect()
-            conn2.disconnect()

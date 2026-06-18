@@ -4,11 +4,12 @@ This module provides formatters that convert Odoo data into
 hierarchical text format optimized for LLM consumption.
 """
 
+import json
 import logging
 from datetime import date, datetime
 from typing import Any, Dict, List, Optional, Set
 
-from .uri_schema import build_record_uri, build_search_uri
+from .uri_schema import build_record_uri
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +35,10 @@ class RecordFormatter:
 
     # Binary field types
     BINARY_FIELDS = {"binary", "image", "file"}
+
+    # Per-field display cap — long values (pasted documents, base64 blobs)
+    # are truncated with an explicit marker to protect the LLM context
+    MAX_FIELD_DISPLAY_LENGTH = 2000
 
     def __init__(self, model: str, max_related_items: int = 5):
         """Initialize the formatter.
@@ -65,9 +70,10 @@ class RecordFormatter:
         lines = []
         indent = "  " * indent_level
 
-        # Record header
+        # Record header. Odoo returns False (not None) for unset char
+        # fields, so chain with `or` instead of relying on .get defaults.
         record_id = record.get("id", "Unknown")
-        record_name = record.get("display_name") or record.get("name", f"Record {record_id}")
+        record_name = record.get("display_name") or record.get("name") or f"Record {record_id}"
 
         lines.append(f"{indent}{'=' * 50}")
         lines.append(f"{indent}Record: {self.model}/{record_id}")
@@ -164,7 +170,7 @@ class RecordFormatter:
 
         # Text fields
         if field_type in ("char", "text", "html"):
-            return str(value)
+            return self._truncate_value(str(value))
 
         # Numeric fields
         elif field_type in ("integer", "float", "monetary"):
@@ -174,8 +180,11 @@ class RecordFormatter:
                 # currency_field = field_meta.get("currency_field", "currency_id")
                 return f"{value:,.2f}"  # Format with thousand separators
             elif field_type == "float":
+                # XML-RPC unmarshals Odoo's digits tuple as a list
                 digits = field_meta.get("digits", (16, 2))
-                precision = digits[1] if isinstance(digits, tuple) else 2
+                precision = (
+                    digits[1] if isinstance(digits, (tuple, list)) and len(digits) == 2 else 2
+                )
                 return f"{value:,.{precision}f}"
             else:
                 return f"{value:,}"  # Integer with thousand separators
@@ -232,9 +241,26 @@ class RecordFormatter:
         elif field_type in self.BINARY_FIELDS:
             return f"[Binary data - use {self.model}/{field_name} to retrieve]"
 
-        # Unknown type
+        # Unknown type (typically: field metadata unavailable)
         else:
-            return str(value)
+            # Render many2one-shaped values readably instead of as a raw repr
+            if (
+                isinstance(value, (list, tuple))
+                and len(value) == 2
+                and isinstance(value[0], int)
+                and isinstance(value[1], str)
+            ):
+                return f"{value[1]} (ID: {value[0]})"
+            # Cap long values (e.g. base64 blobs read without metadata)
+            return self._truncate_value(str(value))
+
+    def _truncate_value(self, text: str) -> str:
+        """Cap a formatted value to keep responses LLM-context friendly."""
+        if len(text) > self.MAX_FIELD_DISPLAY_LENGTH:
+            return (
+                text[: self.MAX_FIELD_DISPLAY_LENGTH] + f"... [truncated, {len(text)} chars total]"
+            )
+        return text
 
     def _format_relation_field(
         self, field_name: str, value: Any, field_meta: Dict[str, Any], indent_level: int
@@ -270,19 +296,24 @@ class RecordFormatter:
                 count = len(value)
                 related_model = field_meta.get("relation", "unknown")
 
-                # Build search URI for the related records
-                if field_type == "one2many":
-                    # For one2many, search by the inverse field
-                    inverse_field = field_meta.get("relation_field", "parent_id")
-                    domain = [(inverse_field, "=", self._get_current_record_id())]
-                else:
-                    # For many2many, we'd need the actual IDs
-                    domain = [("id", "in", value)] if value else []
-
-                search_uri = build_search_uri(related_model, domain=domain)
-
                 lines.append(f"{indent}{field_name}: {count} record(s)")
-                lines.append(f"{indent}  → View all: {search_uri}")
+
+                # Point at the search_records tool with the related ids —
+                # resource URIs cannot carry query parameters, so emitting
+                # odoo://...?domain=... links would produce dead links.
+                related_ids = [
+                    item["id"] if isinstance(item, dict) else item
+                    for item in value
+                    if isinstance(item, (int, dict))
+                ]
+                if related_ids and related_model != "unknown":
+                    shown_ids = related_ids[:50]
+                    domain_str = json.dumps([["id", "in", shown_ids]])
+                    suffix = " (first 50 ids)" if len(related_ids) > 50 else ""
+                    lines.append(
+                        f"{indent}  → View all: use the search_records tool with "
+                        f"model='{related_model}', domain={domain_str}{suffix}"
+                    )
 
                 # Show first few items if count is small
                 if count <= self.max_related_items and isinstance(value[0], dict):
@@ -322,17 +353,6 @@ class RecordFormatter:
         # Fallback to ID
         return f"ID: {record.get('id', 'Unknown')}"
 
-    def _get_current_record_id(self) -> Optional[int]:
-        """Get the current record ID being formatted.
-
-        This is a placeholder that should be set when formatting a specific record.
-
-        Returns:
-            Current record ID or None
-        """
-        # This would be set by the formatting context
-        return None
-
 
 class DatasetFormatter:
     """Formats datasets and search results for LLM consumption."""
@@ -355,8 +375,8 @@ class DatasetFormatter:
         offset: Optional[int] = None,
         total_count: Optional[int] = None,
         fields_metadata: Optional[Dict[str, Any]] = None,
-        next_uri: Optional[str] = None,
-        prev_uri: Optional[str] = None,
+        next_hint: Optional[str] = None,
+        prev_hint: Optional[str] = None,
         current_page: Optional[int] = None,
         total_pages: Optional[int] = None,
     ) -> str:
@@ -370,8 +390,8 @@ class DatasetFormatter:
             offset: Offset used in search
             total_count: Total count of matching records
             fields_metadata: Optional field metadata for rich formatting
-            next_uri: URI for next page of results
-            prev_uri: URI for previous page of results
+            next_hint: How to fetch the next page of results
+            prev_hint: How to fetch the previous page of results
             current_page: Current page number
             total_pages: Total number of pages
 
@@ -424,12 +444,12 @@ class DatasetFormatter:
 
                 lines.append("")
 
-        # Add navigation links
+        # Add navigation hints
         navigation = []
-        if prev_uri:
-            navigation.append(f"← Previous page: {prev_uri}")
-        if next_uri:
-            navigation.append(f"→ Next page: {next_uri}")
+        if prev_hint:
+            navigation.append(f"← Previous page: {prev_hint}")
+        if next_hint:
+            navigation.append(f"→ Next page: {next_hint}")
 
         if navigation:
             lines.append("\nNavigation:")

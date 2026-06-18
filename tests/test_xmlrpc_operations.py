@@ -16,8 +16,6 @@ import pytest
 from mcp_server_odoo.config import OdooConfig
 from mcp_server_odoo.odoo_connection import OdooConnection, OdooConnectionError
 
-from .conftest import ODOO_SERVER_AVAILABLE
-
 
 def skip_on_rate_limit(func):
     """Decorator to skip test if rate limited. Works with both sync and async tests."""
@@ -171,7 +169,6 @@ class TestXMLRPCOperations:
 
 
 @pytest.mark.yolo
-@pytest.mark.skipif(not ODOO_SERVER_AVAILABLE, reason="Odoo server not available")
 class TestXMLRPCOperationsIntegration:
     """Integration tests with real Odoo server."""
 
@@ -237,7 +234,7 @@ class TestXMLRPCOperationsIntegration:
                 "res.partner", [["is_company", "=", True]], ["name", "email", "phone"], limit=3
             )
 
-            assert isinstance(partners, list)
+            assert partners, "expected at least one company partner"
             for partner in partners:
                 assert "name" in partner
                 print(f"Company: {partner.get('name')}")

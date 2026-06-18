@@ -1,5 +1,6 @@
 """Pytest configuration and fixtures for Odoo MCP Server tests."""
 
+import functools
 import os
 import socket
 import xmlrpc.client
@@ -45,7 +46,6 @@ def is_odoo_server_available(host: str = "localhost", port: int = 8069) -> bool:
         return False
 
 
-# Global flag for Odoo server availability — derive host/port from ODOO_URL
 def _parse_odoo_host_port() -> tuple[str, int]:
     from urllib.parse import urlparse
 
@@ -54,8 +54,39 @@ def _parse_odoo_host_port() -> tuple[str, int]:
     return parsed.hostname or "localhost", parsed.port or 8069
 
 
-_host, _port = _parse_odoo_host_port()
-ODOO_SERVER_AVAILABLE = is_odoo_server_available(_host, _port)
+# Probes are LAZY and memoized: unit-only runs must not touch the network.
+# They are triggered from pytest_collection_modifyitems only when yolo/mcp
+# tests were actually collected (and survive the -m filter).
+@functools.lru_cache(maxsize=1)
+def odoo_server_available() -> bool:
+    """Whether a (vanilla) Odoo answers XML-RPC at ODOO_URL."""
+    host, port = _parse_odoo_host_port()
+    return is_odoo_server_available(host, port)
+
+
+@functools.lru_cache(maxsize=1)
+def mcp_module_available() -> bool:
+    """Whether the Odoo at ODOO_URL also has the MCP module installed.
+
+    A vanilla Odoo (the YOLO scenario) serves /xmlrpc/2/* but not the
+    /mcp/ REST routes — mcp-marked tests must skip there instead of
+    failing with confusing 404/auth errors.
+    """
+    if not odoo_server_available():
+        return False
+    url = os.getenv("ODOO_URL", "http://localhost:8069").rstrip("/") + "/mcp/health"
+    try:
+        import urllib.request
+
+        # Multi-DB instances can't route /mcp/health without an explicit database
+        request = urllib.request.Request(url)
+        db = os.getenv("ODOO_DB")
+        if db:
+            request.add_header("X-Odoo-Database", db)
+        with urllib.request.urlopen(request, timeout=3) as response:
+            return response.status == 200
+    except Exception:
+        return False
 
 
 def pytest_configure(config):
@@ -65,46 +96,53 @@ def pytest_configure(config):
 
 
 def pytest_collection_modifyitems(config, items):
-    """Modify test collection to skip tests that require Odoo when it's not available."""
-    if ODOO_SERVER_AVAILABLE:
-        # Server is available, don't skip anything
+    """Skip yolo/mcp tests when their backing services are unavailable."""
+    # Respect the -m filter: only probe for tests that will actually run
+    selected = [item for item in items if not _deselected_by_mark_filter(config, item)]
+    needs_server = any("yolo" in item.keywords or "mcp" in item.keywords for item in selected)
+    if not needs_server:
         return
 
-    skip_odoo = pytest.mark.skip(reason=f"Odoo server not available at {_host}:{_port}")
+    host, port = _parse_odoo_host_port()
+    if not odoo_server_available():
+        skip_odoo = pytest.mark.skip(reason=f"Odoo server not available at {host}:{port}")
+        for item in items:
+            if "yolo" in item.keywords or "mcp" in item.keywords:
+                item.add_marker(skip_odoo)
+        return
 
-    for item in items:
-        if "yolo" in item.keywords or "mcp" in item.keywords:
-            item.add_marker(skip_odoo)
+    needs_mcp = any("mcp" in item.keywords for item in selected)
+    if needs_mcp and not mcp_module_available():
+        skip_mcp = pytest.mark.skip(
+            reason="Odoo MCP module not available (GET /mcp/health failed) — vanilla Odoo?"
+        )
+        for item in items:
+            if "mcp" in item.keywords:
+                item.add_marker(skip_mcp)
 
 
-@pytest.fixture(autouse=True)
-def rate_limit_delay(request):
-    """Add a delay between tests to avoid rate limiting (only when needed)."""
-    yield
+def _deselected_by_mark_filter(config, item) -> bool:
+    """Whether the -m expression deselects this item."""
+    markexpr = config.option.markexpr
+    if not markexpr:
+        return False
+    try:
+        # Private pytest API (import and signatures have churned across
+        # pytest releases) — if it changes shape, fall back to "selected":
+        # worst case an unnecessary server probe, never a wrong skip
+        from _pytest.mark.expression import Expression
+
+        return not Expression.compile(markexpr).evaluate(lambda name: name in item.keywords)
+    except Exception:
+        return False
 
 
 @pytest.fixture
 def odoo_server_required():
     """Fixture that skips test if Odoo server is not available."""
-    if not ODOO_SERVER_AVAILABLE:
-        pytest.skip(f"Odoo server not available at {_host}:{_port}")
-
-
-@pytest.fixture
-def handle_rate_limit():
-    """Fixture that handles rate limiting errors gracefully."""
-    import urllib.error
-
-    try:
-        yield
-    except Exception as e:
-        # Check if this is a rate limit error
-        if isinstance(e, urllib.error.HTTPError) and e.code == 429:
-            pytest.skip("Skipping due to rate limiting")
-        elif "429" in str(e) or "TOO MANY REQUESTS" in str(e):
-            pytest.skip("Skipping due to rate limiting")
-        else:
-            raise
+    if not odoo_server_available():
+        host, port = _parse_odoo_host_port()
+        pytest.skip(f"Odoo server not available at {host}:{port}")
 
 
 @pytest.fixture
@@ -143,7 +181,7 @@ def model_discovery():
     if not MODEL_DISCOVERY_AVAILABLE:
         pytest.skip("Model Discovery not available")
 
-    if not ODOO_SERVER_AVAILABLE:
+    if not odoo_server_available():
         pytest.skip("Odoo server not available")
 
     # Create config for discovery

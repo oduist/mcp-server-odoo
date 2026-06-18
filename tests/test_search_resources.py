@@ -10,9 +10,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp_server_odoo.access_control import AccessControlError, AccessController
 from mcp_server_odoo.config import OdooConfig, load_config
 from mcp_server_odoo.error_handling import (
-    PermissionError as MCPPermissionError,
-)
-from mcp_server_odoo.error_handling import (
+    MCPPermissionError,
     ValidationError,
 )
 from mcp_server_odoo.odoo_connection import OdooConnection, OdooConnectionError
@@ -112,7 +110,11 @@ class TestSearchResource:
         mock_connection.search.assert_called_once_with(
             "res.partner", [], limit=10, offset=0, order=None
         )
-        mock_connection.read.assert_called_once_with("res.partner", [1, 2, 3, 4, 5], None)
+        # Without an explicit field list the handler restricts the read to
+        # safe (non-binary/html) fields derived from fields_get
+        mock_connection.read.assert_called_once_with(
+            "res.partner", [1, 2, 3, 4, 5], ["name", "email"]
+        )
 
         # Check result format
         assert "Search Results: res.partner" in result
@@ -218,6 +220,32 @@ class TestSearchResource:
         assert "Showing records 11-15 of 50" in result
         assert "→ Next page:" in result
         assert "← Previous page:" in result
+        # Navigation must reference the search_records tool, never an
+        # unroutable odoo://...?query URI (FastMCP cannot route query params)
+        assert "search_records tool with offset=15" in result
+        assert "search_records tool with offset=5" in result
+        assert "odoo://res.partner/search?" not in result
+
+    @pytest.mark.asyncio
+    async def test_search_excludes_binary_and_html_fields(
+        self, resource_handler, mock_connection, mock_access_controller
+    ):
+        """Default search reads must skip binary/html/serialized fields."""
+        mock_access_controller.validate_model_access.return_value = None
+        mock_connection.search_count.return_value = 1
+        mock_connection.search.return_value = [1]
+        mock_connection.read.return_value = [{"id": 1, "name": "Partner 1"}]
+        mock_connection.fields_get.return_value = {
+            "name": {"type": "char", "string": "Name"},
+            "image_1920": {"type": "binary", "string": "Image"},
+            "comment": {"type": "html", "string": "Notes"},
+            "_private": {"type": "char", "string": "Private"},
+        }
+
+        await resource_handler._handle_search("res.partner", None, None, None, None, None)
+
+        fields_read = mock_connection.read.call_args[0][2]
+        assert fields_read == ["name"]
 
     @pytest.mark.asyncio
     async def test_search_with_order(

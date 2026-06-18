@@ -113,13 +113,20 @@ class TestRead:
         kwargs = conn._object_proxy.execute_kw.call_args[0][6]
         assert kwargs["fields"] == ["name", "email"]
 
-    def test_read_empty_fields_not_passed(self, connected_connection):
-        """read() with empty fields list should not pass 'fields' kwarg."""
+    def test_read_empty_fields_passed_through(self, connected_connection):
+        """read() passes fields=[] through verbatim; only None omits the kwarg.
+
+        Mapping [] to smart defaults happens in the tool layer — the
+        connection must not silently turn [] into "all fields".
+        """
         conn = connected_connection
         conn._object_proxy.execute_kw.return_value = []
 
         conn.read("res.partner", [1], [])
+        kwargs = conn._object_proxy.execute_kw.call_args[0][6]
+        assert kwargs.get("fields") == []
 
+        conn.read("res.partner", [1], None)
         kwargs = conn._object_proxy.execute_kw.call_args[0][6]
         assert "fields" not in kwargs
 
@@ -138,20 +145,6 @@ class TestCreate:
         args = conn._object_proxy.execute_kw.call_args[0]
         assert args[4] == "create"
         assert args[5] == [{"name": "New Partner"}]
-
-    def test_create_invalidates_cache(self, connected_connection):
-        """create() should invalidate the record cache for the model."""
-        conn = connected_connection
-        conn._object_proxy.execute_kw.return_value = 10
-
-        # Prime the cache
-        conn._performance_manager.cache_record("res.partner", {"id": 1, "name": "Old"})
-
-        conn.create("res.partner", {"name": "New"})
-
-        # Cache should be invalidated (model-wide invalidation)
-        cached = conn._performance_manager.get_cached_record("res.partner", 1)
-        assert cached is None
 
     def test_create_propagates_xmlrpc_fault(self, connected_connection):
         """create() should wrap XML-RPC faults as OdooConnectionError."""
@@ -179,19 +172,6 @@ class TestWrite:
         assert args[4] == "write"
         assert args[5] == [[1], {"name": "Updated"}]
 
-    def test_write_invalidates_cache_per_record(self, connected_connection):
-        """write() should invalidate cache for each updated record."""
-        conn = connected_connection
-        conn._object_proxy.execute_kw.return_value = True
-
-        conn._performance_manager.cache_record("res.partner", {"id": 1, "name": "Old1"})
-        conn._performance_manager.cache_record("res.partner", {"id": 2, "name": "Old2"})
-
-        conn.write("res.partner", [1, 2], {"name": "Updated"})
-
-        assert conn._performance_manager.get_cached_record("res.partner", 1) is None
-        assert conn._performance_manager.get_cached_record("res.partner", 2) is None
-
 
 class TestUnlink:
     """Test OdooConnection.unlink() method."""
@@ -207,16 +187,6 @@ class TestUnlink:
         args = conn._object_proxy.execute_kw.call_args[0]
         assert args[4] == "unlink"
         assert args[5] == [[1, 2]]
-
-    def test_unlink_invalidates_cache(self, connected_connection):
-        """unlink() should invalidate cache for deleted records."""
-        conn = connected_connection
-        conn._object_proxy.execute_kw.return_value = True
-
-        conn._performance_manager.cache_record("res.partner", {"id": 5})
-        conn.unlink("res.partner", [5])
-
-        assert conn._performance_manager.get_cached_record("res.partner", 5) is None
 
 
 class TestFieldsGet:
@@ -380,3 +350,80 @@ class TestExecuteKwErrorHandling:
 
         kwargs = conn._object_proxy.execute_kw.call_args[0][6]
         assert kwargs["context"]["lang"] == "de_DE"
+
+    def test_marshal_none_fault_returns_none(self, connected_connection):
+        """Odoo's "cannot marshal None" fault is translated to a None return.
+
+        Methods like ``toggle_active`` and ``action_archive`` mutate state then
+        return ``None``. Odoo's XML-RPC marshaller is configured with
+        ``allow_none=False`` and raises a Fault on the response — even though
+        the call already succeeded server-side. ``execute_kw`` recognizes this
+        and returns ``None`` so callers see normal Python semantics.
+        """
+        conn = connected_connection
+        conn._object_proxy.execute_kw.side_effect = xmlrpc.client.Fault(
+            1,
+            "Traceback (most recent call last):\n"
+            "  File ..., in dump_nil\n"
+            "    raise TypeError('cannot marshal None unless allow_none is enabled')\n"
+            "TypeError: cannot marshal None unless allow_none is enabled",
+        )
+
+        result = conn.execute_kw("res.partner", "toggle_active", [[1]], {})
+        assert result is None
+
+    def test_other_xmlrpc_fault_still_raises(self, connected_connection):
+        """A regular Odoo Fault is still wrapped as OdooConnectionError."""
+        conn = connected_connection
+        conn._object_proxy.execute_kw.side_effect = xmlrpc.client.Fault(
+            1,
+            "ValueError: Invalid field 'bad_field' on model 'res.partner'",
+        )
+
+        with pytest.raises(OdooConnectionError, match="Operation failed"):
+            conn.execute_kw("res.partner", "do_thing", [[1]], {})
+
+    def test_marshal_none_substring_alone_does_not_swallow(self, connected_connection):
+        """Only the full ``cannot marshal None unless allow_none`` signature is treated
+        as a void return. A fault whose message merely contains the looser substring
+        "cannot marshal None" must still raise — not be silently turned into None.
+        """
+        conn = connected_connection
+        conn._object_proxy.execute_kw.side_effect = xmlrpc.client.Fault(
+            1,
+            "ValidationError: User said 'cannot marshal None' in a message — distinct fault",
+        )
+
+        with pytest.raises(OdooConnectionError, match="Operation failed"):
+            conn.execute_kw("res.partner", "do_thing", [[1]], {})
+
+
+class TestTimeoutRetryGating:
+    """execute_kw must mark the transport's timeout-retry flag per call:
+    only read-only methods may be re-sent after a keepalive socket timeout
+    (issue #68) — a re-sent write could be double-executed."""
+
+    def test_read_method_marks_transport_retry_safe(self, connected_connection):
+        conn = connected_connection
+        conn._object_proxy.execute_kw.return_value = []
+
+        conn.execute_kw("res.partner", "search_read", [[]], {})
+
+        assert conn._object_proxy("transport").timeout_retry_safe is True
+
+    def test_write_method_marks_transport_retry_unsafe(self, connected_connection):
+        conn = connected_connection
+        conn._object_proxy.execute_kw.return_value = 1
+
+        conn.execute_kw("res.partner", "create", [{"name": "X"}], {})
+
+        assert conn._object_proxy("transport").timeout_retry_safe is False
+
+    def test_arbitrary_method_marks_transport_retry_unsafe(self, connected_connection):
+        """call_model_method targets (workflow methods) are writes by default."""
+        conn = connected_connection
+        conn._object_proxy.execute_kw.return_value = True
+
+        conn.execute_kw("sale.order", "action_confirm", [[1]], {})
+
+        assert conn._object_proxy("transport").timeout_retry_safe is False

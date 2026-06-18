@@ -125,31 +125,6 @@ class TestErrorSanitizationIntegration:
         assert "res.partner" in error_msg
         assert "999999" in error_msg
 
-    @pytest.mark.asyncio
-    async def test_mcp_error_response_sanitization(self, tool_handler):
-        """Test that MCP error responses are sanitized."""
-        from mcp_server_odoo.error_handling import ValidationError
-
-        # Create an error with internal details
-        error = ValidationError(
-            "Failed to execute search_count on res.partner: Invalid field res.partner.test_field",
-            details={
-                "error_type": "XMLRPCFault",
-                "traceback": "Full traceback here...",
-                "field": "test_field",
-                "model": "res.partner",
-            },
-        )
-
-        mcp_error = error.to_mcp_error()
-
-        # Check sanitized message
-        assert "Failed to execute search_count" not in mcp_error.message
-        assert "XMLRPCFault" not in str(mcp_error.data)
-        assert "traceback" not in mcp_error.data["details"]
-        assert mcp_error.data["details"]["field"] == "test_field"
-        assert mcp_error.data["details"]["model"] == "res.partner"
-
     def test_complex_error_chain_sanitization(self):
         """Test sanitization of complex error chains."""
         from mcp_server_odoo.error_sanitizer import ErrorSanitizer

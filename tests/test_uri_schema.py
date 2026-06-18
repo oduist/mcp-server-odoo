@@ -65,15 +65,6 @@ class TestURIParsing:
         assert parsed.offset == 20
         assert parsed.order == "date_order desc"
 
-    def test_parse_browse_uri(self):
-        """Test parsing browse URIs."""
-        uri = "odoo://res.partner/browse?ids=1,2,3,4"
-        parsed = parse_uri(uri)
-
-        assert parsed.model == "res.partner"
-        assert parsed.operation == OdooOperation.BROWSE
-        assert parsed.ids == [1, 2, 3, 4]
-
     def test_parse_count_uri(self):
         """Test parsing count URIs."""
         uri = "odoo://res.partner/count?domain=[('country_id.code','=','US')]"
@@ -141,11 +132,6 @@ class TestURIParsing:
         with pytest.raises(URIValidationError, match="Record operation requires an ID"):
             parse_uri("odoo://res.partner/record")
 
-    def test_parse_uri_browse_without_ids(self):
-        """Test parsing browse URIs without IDs parameter."""
-        with pytest.raises(URIValidationError, match="Browse operation requires 'ids' parameter"):
-            parse_uri("odoo://res.partner/browse")
-
     def test_parse_uri_invalid_limit(self):
         """Test parsing URIs with invalid limit parameter."""
         with pytest.raises(URIValidationError, match="Invalid limit value"):
@@ -158,11 +144,6 @@ class TestURIParsing:
         """Test parsing URIs with invalid offset parameter."""
         with pytest.raises(URIValidationError, match="Invalid offset value"):
             parse_uri("odoo://res.partner/search?offset=xyz")
-
-    def test_parse_uri_invalid_ids(self):
-        """Test parsing URIs with invalid IDs parameter."""
-        with pytest.raises(URIValidationError, match="Invalid IDs parameter"):
-            parse_uri("odoo://res.partner/browse?ids=1,abc,3")
 
     def test_odoo_uri_to_uri(self):
         """Test converting OdooURI back to string."""
@@ -222,11 +203,6 @@ class TestURIBuilding:
         assert parsed.limit == 25
         assert parsed.offset == 50
         assert parsed.order == "date_order desc"
-
-    def test_build_browse_uri(self):
-        """Test building browse URIs."""
-        uri = build_uri("res.partner", "browse", ids=[1, 2, 3, 4])
-        assert "odoo://res.partner/browse?ids=1%2C2%2C3%2C4" == uri
 
     def test_build_count_uri(self):
         """Test building count URIs."""
@@ -338,15 +314,6 @@ class TestURIRoundTrip:
         assert reparsed.offset == parsed.offset
         assert reparsed.order == parsed.order
 
-    def test_roundtrip_browse(self):
-        """Test browse URI round-trip."""
-        original = build_uri("product.product", "browse", ids=[10, 20, 30, 40, 50])
-        parsed = parse_uri(original)
-        rebuilt = parsed.to_uri()
-        reparsed = parse_uri(rebuilt)
-
-        assert reparsed.ids == parsed.ids
-
 
 class TestURIEdgeCases:
     """Test edge cases and special scenarios."""
@@ -386,11 +353,3 @@ class TestURIEdgeCases:
         uri = "odoo://res.partner/record/999999999"
         parsed = parse_uri(uri)
         assert parsed.record_id == 999999999
-
-    def test_browse_with_many_ids(self):
-        """Test browse with many IDs."""
-        ids = list(range(1, 101))  # 100 IDs
-        uri = build_uri("res.partner", "browse", ids=ids)
-        parsed = parse_uri(uri)
-        assert parsed.ids == ids
-        assert len(parsed.ids) == 100

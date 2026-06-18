@@ -7,10 +7,11 @@ to Odoo via XML-RPC using MCP-specific endpoints.
 import json
 import logging
 import socket
+import threading
 import urllib.error
 import urllib.request
 import xmlrpc.client
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from typing import Any, Dict, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
@@ -19,6 +20,57 @@ from .error_sanitizer import ErrorSanitizer
 from .performance import PerformanceManager
 
 logger = logging.getLogger(__name__)
+
+# Keys whose values must never appear in logs
+_SENSITIVE_KEYS = {"password", "api_key", "token", "secret", "access_token", "new_password"}
+
+# Methods that are read-only on the server and therefore safe to re-send
+# after a keepalive socket timeout (issue #68 recovery). Anything else —
+# create/write/unlink and arbitrary call_model_method targets — could be
+# double-executed by a re-send and must let the timeout propagate.
+_TIMEOUT_RETRY_SAFE_METHODS = frozenset(
+    {
+        "read",
+        "search",
+        "search_read",
+        "search_count",
+        "fields_get",
+        "read_group",
+        "formatted_read_group",
+        "default_get",
+        "name_get",
+        "name_search",
+    }
+)
+
+
+def _redact_values(value: Any) -> Any:
+    """Redact sensitive values in dicts/lists for safe logging."""
+    if isinstance(value, dict):
+        return {
+            k: "***" if k.lower() in _SENSITIVE_KEYS else _redact_values(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_values(v) for v in value]
+    return value
+
+
+def _describe_args(args: Any) -> Any:
+    """Describe positional RPC args for logging: redacted, with long
+    strings summarized (binary payloads would bloat the log)."""
+    redacted = _redact_values(args)
+
+    def summarize(value: Any) -> Any:
+        if isinstance(value, str) and len(value) > 200:
+            return f"<str len={len(value)}>"
+        if isinstance(value, dict):
+            return {k: summarize(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [summarize(v) for v in value]
+        return value
+
+    return summarize(redacted)
 
 
 class OdooConnectionError(Exception):
@@ -76,12 +128,22 @@ class OdooConnection:
                 )
 
         # Performance manager for optimizations
-        self._performance_manager = performance_manager or PerformanceManager(config)
+        self._performance_manager = performance_manager or PerformanceManager(
+            config, timeout=timeout
+        )
 
         # XML-RPC proxies (created on connect)
         self._db_proxy: Optional[xmlrpc.client.ServerProxy] = None
         self._common_proxy: Optional[xmlrpc.client.ServerProxy] = None
         self._object_proxy: Optional[xmlrpc.client.ServerProxy] = None
+
+        # Per-proxy locks: ServerProxy/Transport are not thread-safe, and tool
+        # handlers offload calls to worker threads via asyncio.to_thread. Locks
+        # are scoped to the raw proxy invocation only (never whole methods —
+        # execute_kw recurses on locale fallback).
+        self._db_proxy_lock = threading.Lock()
+        self._common_proxy_lock = threading.Lock()
+        self._object_proxy_lock = threading.Lock()
 
         # Connection state
         self._connected = False
@@ -131,26 +193,6 @@ class OdooConnection:
 
         except Exception as e:
             raise OdooConnectionError(f"Failed to parse URL: {e}") from e
-
-    def _create_transport(self) -> xmlrpc.client.Transport:
-        """Create XML-RPC transport with timeout support.
-
-        Returns:
-            Configured Transport object
-        """
-
-        class TimeoutTransport(xmlrpc.client.Transport):
-            def __init__(self, timeout, *args, **kwargs):
-                self.timeout = timeout
-                super().__init__(*args, **kwargs)
-
-            def make_connection(self, host):
-                connection = super().make_connection(host)
-                if hasattr(connection, "sock") and connection.sock:
-                    connection.sock.settimeout(self.timeout)
-                return connection
-
-        return TimeoutTransport(self.timeout)
 
     def _build_endpoint_url(self, endpoint: str) -> str:
         """Build full URL for an MCP endpoint.
@@ -252,7 +294,8 @@ class OdooConnection:
         """
         try:
             # Try to get server version via common endpoint
-            version = self._common_proxy.version()
+            with self._common_proxy_lock:
+                version = self._common_proxy.version()
             self._server_version = version.get("server_version", "") if version else None
             logger.debug(f"Server version: {version}")
         except Exception as e:
@@ -269,7 +312,17 @@ class OdooConnection:
                     pass
             return
 
-        # Clear proxies (but don't close pooled connections)
+        # Close each proxy's transport — otherwise cached keepalive
+        # sockets linger until GC (matters for connect/disconnect cycles)
+        for proxy, lock in (
+            (self._db_proxy, self._db_proxy_lock),
+            (self._common_proxy, self._common_proxy_lock),
+            (self._object_proxy, self._object_proxy_lock),
+        ):
+            if proxy is not None:
+                with lock, suppress(Exception):
+                    proxy("close")()
+
         self._db_proxy = None
         self._common_proxy = None
         self._object_proxy = None
@@ -299,7 +352,8 @@ class OdooConnection:
 
         try:
             # Try to get server version as health check
-            version = self._common_proxy.version()
+            with self._common_proxy_lock:
+                version = self._common_proxy.version()
             return True, f"Connected to Odoo {version.get('server_version', 'unknown')}"
         except socket.timeout:
             return False, f"Health check timeout after {self.timeout} seconds"
@@ -419,9 +473,11 @@ class OdooConnection:
 
         try:
             # Call list_db method on database proxy
-            databases = self.db_proxy.list()
-            logger.info(f"Found {len(databases)} databases: {databases}")
-            return databases  # type: ignore[invalid-return-type]  # XML-RPC proxy is untyped
+            with self._db_proxy_lock:
+                databases = self.db_proxy.list()
+            logger.info(f"Found {len(databases)} databases")
+            logger.debug(f"Database names: {databases}")
+            return databases  # ty: ignore[invalid-return-type]  # XML-RPC proxy is untyped
         except xmlrpc.client.Fault as e:
             if self.config.is_yolo_enabled and "Access Denied" in str(e):
                 # Common error when database listing is restricted
@@ -539,9 +595,10 @@ class OdooConnection:
             if self.config.uses_credentials:
                 # Try to authenticate with the database
                 # This will fail if we don't have access
-                uid = self.common_proxy.authenticate(
-                    db_name, self.config.username, self.config.password, {}
-                )
+                with self._common_proxy_lock:
+                    uid = self.common_proxy.authenticate(
+                        db_name, self.config.username, self.config.password, {}
+                    )
                 if uid:
                     logger.info(f"Successfully validated access to database '{db_name}'")
                     return True
@@ -576,12 +633,13 @@ class OdooConnection:
 
         try:
             # Use standard XML-RPC auth with API key as password
-            uid = self.common_proxy.authenticate(
-                database, self.config.username, self.config.api_key, {}
-            )
+            with self._common_proxy_lock:
+                uid = self.common_proxy.authenticate(
+                    database, self.config.username, self.config.api_key, {}
+                )
 
             if uid:
-                self._uid = uid  # type: ignore[invalid-assignment]  # XML-RPC proxy is untyped
+                self._uid = uid  # ty: ignore[invalid-assignment]  # XML-RPC proxy is untyped
                 self._database = database
                 self._auth_method = "api_key"
                 self._authenticated = True
@@ -705,12 +763,13 @@ class OdooConnection:
 
         try:
             # Use common proxy to authenticate
-            uid = self.common_proxy.authenticate(
-                database, self.config.username, self.config.password, {}
-            )
+            with self._common_proxy_lock:
+                uid = self.common_proxy.authenticate(
+                    database, self.config.username, self.config.password, {}
+                )
 
             if uid:
-                self._uid = uid  # type: ignore[invalid-assignment]  # XML-RPC proxy is untyped
+                self._uid = uid  # ty: ignore[invalid-assignment]  # XML-RPC proxy is untyped
                 self._database = database
                 self._auth_method = "password"
                 self._authenticated = True
@@ -773,7 +832,12 @@ class OdooConnection:
 
                     # Only try fallback if we have credentials
                     if self.config.uses_credentials:
-                        logger.info(f"{error_msg}, trying username/password fallback")
+                        logger.warning(
+                            f"{error_msg} — the configured ODOO_API_KEY was rejected. "
+                            "Falling back to username/password authentication. "
+                            "Verify or rotate the API key; permission checks will "
+                            "use session authentication for this run."
+                        )
             except OdooConnectionError as e:
                 # Critical error (network, etc.) - don't try fallback
                 logger.error(f"Critical error during {auth_method} authentication: {e}")
@@ -889,13 +953,24 @@ class OdooConnection:
             kwargs["context"].setdefault("lang", self.config.locale)
 
         try:
-            # Log the operation
-            logger.debug(f"Executing {method} on {model} with args={args}, kwargs={kwargs}")
+            # Log the operation (values redacted — write payloads can carry
+            # passwords/PII that must not land in log files)
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"Executing {method} on {model} with "
+                    f"args={_describe_args(args)}, kwargs={_redact_values(kwargs)}"
+                )
 
-            # Execute via object proxy
-            result = self.object_proxy.execute_kw(
-                self._database, self._uid, password_or_token, model, method, args, kwargs
-            )
+            # Execute via object proxy. The transport's timeout-retry flag is
+            # set under the same lock acquisition as the request, so
+            # concurrent callers can't race it.
+            with self._object_proxy_lock:
+                self.object_proxy("transport").timeout_retry_safe = (
+                    method in _TIMEOUT_RETRY_SAFE_METHODS
+                )
+                result = self.object_proxy.execute_kw(
+                    self._database, self._uid, password_or_token, model, method, args, kwargs
+                )
 
             logger.debug("Operation completed successfully")
             return result
@@ -910,6 +985,13 @@ class OdooConnection:
                 self.config.locale = None
                 kwargs.get("context", {}).pop("lang", None)
                 return self.execute_kw(model, method, args, kwargs)
+
+            # Odoo's XML-RPC marshaller (allow_none=False) faults on void
+            # returns, but the method already ran. Match the full dump_nil
+            # signature so unrelated faults mentioning "cannot marshal None"
+            # aren't silently swallowed.
+            if "cannot marshal None unless allow_none" in e.faultString:
+                return None
 
             logger.error(f"XML-RPC fault during {method} on {model}: {e}")
             # Sanitize the fault string before exposing to user
@@ -951,7 +1033,7 @@ class OdooConnection:
             List of dictionaries containing record data
         """
         kwargs = {}
-        if fields:
+        if fields is not None:
             kwargs["fields"] = fields
 
         with self._performance_manager.monitor.track_operation(f"read_{model}"):
@@ -977,7 +1059,7 @@ class OdooConnection:
         Returns:
             List of dictionaries containing record data
         """
-        if fields:
+        if fields is not None:
             kwargs["fields"] = fields
         return self.execute_kw(model, "search_read", [domain], kwargs)
 
@@ -1041,8 +1123,6 @@ class OdooConnection:
         try:
             with self._performance_manager.monitor.track_operation(f"create_{model}"):
                 record_id = self.execute_kw(model, "create", [values], {})
-                # Invalidate cache for this model
-                self._performance_manager.invalidate_record_cache(model)
                 logger.info(f"Created {model} record with ID {record_id}")
                 return record_id
         except Exception as e:
@@ -1066,9 +1146,6 @@ class OdooConnection:
         try:
             with self._performance_manager.monitor.track_operation(f"write_{model}"):
                 result = self.execute_kw(model, "write", [ids, values], {})
-                # Invalidate cache for updated records
-                for record_id in ids:
-                    self._performance_manager.invalidate_record_cache(model, record_id)
                 logger.info(f"Updated {len(ids)} {model} record(s)")
                 return result
         except Exception as e:
@@ -1091,9 +1168,6 @@ class OdooConnection:
         try:
             with self._performance_manager.monitor.track_operation(f"unlink_{model}"):
                 result = self.execute_kw(model, "unlink", [ids], {})
-                # Invalidate cache for deleted records
-                for record_id in ids:
-                    self._performance_manager.invalidate_record_cache(model, record_id)
                 logger.info(f"Deleted {len(ids)} {model} record(s)")
                 return result
         except Exception as e:
@@ -1115,15 +1189,21 @@ class OdooConnection:
             return None
 
         try:
-            return self.common_proxy.version()  # type: ignore[invalid-return-type]  # XML-RPC proxy is untyped
+            with self._common_proxy_lock:
+                return self.common_proxy.version()  # ty: ignore[invalid-return-type]  # XML-RPC proxy is untyped
         except Exception as e:
             logger.error(f"Failed to get server version: {e}")
             return None
 
-    def _get_major_version(self) -> Optional[int]:
-        """Extract the major version number from the server version string.
+    def get_major_version(self) -> Optional[int]:
+        """Return the Odoo major version number, or ``None`` if unknown.
 
-        Handles standard versions (e.g. '18.0') and SaaS versions (e.g. 'saas~18.1').
+        Handles standard versions (e.g. ``'18.0'`` → ``18``) and SaaS
+        versions (e.g. ``'saas~18.1'`` → ``18``). Reads the cached
+        ``_server_version`` populated during ``connect()``.
+
+        Public so that tool handlers can branch on Odoo version (e.g. to
+        choose between ``formatted_read_group`` and ``read_group``).
         """
         if not self._server_version:
             return None
@@ -1143,7 +1223,7 @@ class OdooConnection:
         /web# hash format for older versions.
         """
         base_url = self._url_components["base_url"]
-        major = self._get_major_version()
+        major = self.get_major_version()
         if major is not None and major >= 18:
             return f"{base_url}/odoo/{model}/{record_id}"
         return f"{base_url}/web#id={record_id}&model={model}&view_type=form"

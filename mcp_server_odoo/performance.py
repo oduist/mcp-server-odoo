@@ -7,14 +7,17 @@ This module provides performance optimizations including:
 - Performance monitoring and metrics
 """
 
+import errno
+import http.client
 import json
+import ssl
 import threading
 import time
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Union
 from xmlrpc.client import SafeTransport, ServerProxy, Transport
 
 from .config import OdooConfig
@@ -135,19 +138,33 @@ class Cache:
             # Calculate size (rough estimate)
             size_bytes = len(json.dumps(value, default=str).encode())
 
-            # Check memory limit
-            if self._stats.total_size_bytes + size_bytes > self._max_memory_bytes:
+            # Refuse to cache values larger than the whole budget
+            if size_bytes > self._max_memory_bytes:
+                logger.debug(
+                    f"Skipping cache for {key}: value ({size_bytes} bytes) "
+                    f"exceeds cache budget ({self._max_memory_bytes} bytes)"
+                )
+                return
+
+            # Replacing an existing key frees its size and doesn't change
+            # the entry count — remove it first so the eviction checks
+            # below don't evict an unrelated entry.
+            if key in self._cache:
+                old_size = self._cache.pop(key).size_bytes
+                self._stats.total_size_bytes -= old_size
+
+            # Enforce memory limit (loop: one LRU eviction may not free
+            # enough for the incoming entry)
+            while self._cache and (
+                self._stats.total_size_bytes + size_bytes > self._max_memory_bytes
+            ):
                 self._evict_lru(reason="size")
 
-            # Check size limit
+            # Enforce entry-count limit
             while len(self._cache) >= self._max_size:
                 self._evict_lru(reason="size")
 
-            # Add or update entry
             now = datetime.now()
-            if key in self._cache:
-                old_size = self._cache[key].size_bytes
-                self._stats.total_size_bytes -= old_size
 
             entry = CacheEntry(
                 key=key,
@@ -256,252 +273,182 @@ class Cache:
             self._remove(key, reason)
 
 
-class OdooTransport(Transport):
-    """HTTP transport that injects X-Odoo-Database header for multi-DB routing."""
+# OSErrors the stdlib xmlrpc Transport treats as "cached connection went
+# cold" and retries once on (see xmlrpc.client.Transport.request)
+_RETRYABLE_ERRNOS = (errno.ECONNRESET, errno.ECONNABORTED, errno.EPIPE)
 
-    def __init__(self, database: Optional[str] = None, **kwargs):
+
+def _retry_once_request(self, host, handler, request_body, verbose=False):
+    """Like ``xmlrpc.client.Transport.request``, but also recovers from
+    half-open keepalive sockets (issue #68).
+
+    Stdlib retries once on ECONNRESET/ECONNABORTED/EPIPE/RemoteDisconnected —
+    the cases where the peer closed the cached connection cleanly. But a load
+    balancer that drops its upstream WITHOUT sending FIN/RST leaves the cached
+    socket looking alive: the write succeeds into the dead socket's buffer and
+    the read blocks until the socket timeout fires as ``TimeoutError``.
+
+    We retry that case too — but ONLY when the timed-out attempt went over a
+    REUSED keepalive socket. A timeout on a freshly-opened connection means
+    the server is genuinely slow; retrying would double the wait and, worse,
+    could double-submit a write the server is still processing.
+
+    On a reused socket a half-open peer and a genuinely slow server are
+    indistinguishable too, so the timeout retry is additionally gated on
+    ``timeout_retry_safe``: OdooConnection.execute_kw sets it per call, and
+    only read-only methods may be re-sent — a timed-out write could already
+    be committing server-side and re-sending it would double-execute it.
+    """
+    for i in (0, 1):
+        # Half-open detection: is there a cached connection with a live
+        # socket about to be reused? (Fresh connections have sock=None
+        # until the request is sent.)
+        cached = getattr(self, "_connection", (None, None))[1]
+        reused_keepalive = cached is not None and getattr(cached, "sock", None) is not None
+        try:
+            return self.single_request(host, handler, request_body, verbose)
+        except TimeoutError:
+            if i or not reused_keepalive or not getattr(self, "timeout_retry_safe", True):
+                raise
+            self.close()
+        except http.client.RemoteDisconnected:
+            if i:
+                raise
+            self.close()
+        except OSError as e:
+            if i or e.errno not in _RETRYABLE_ERRNOS:
+                raise
+            self.close()
+
+
+class OdooTransport(Transport):
+    """HTTP transport that injects X-Odoo-Database header for multi-DB routing
+    and bounds socket I/O with a timeout."""
+
+    # Set per call by OdooConnection.execute_kw (under the per-proxy lock):
+    # only read-only methods may be re-sent after a keepalive timeout. The
+    # True default means the common/db proxies always retry — those
+    # endpoints carry only idempotent calls (authenticate/version/list).
+    timeout_retry_safe: bool = True
+
+    def __init__(self, database: Optional[str] = None, timeout: Optional[float] = None, **kwargs):
         super().__init__(**kwargs)
         self.database = database
+        self.timeout = timeout
+
+    def make_connection(self, host):
+        connection = super().make_connection(host)
+        if self.timeout is not None:
+            connection.timeout = self.timeout
+        return connection
 
     def send_headers(self, connection, headers):
         super().send_headers(connection, headers)
         if self.database:
             connection.putheader("X-Odoo-Database", self.database)
+
+    request = _retry_once_request
 
 
 class OdooSafeTransport(SafeTransport):
-    """HTTPS transport that injects X-Odoo-Database header for multi-DB routing."""
+    """HTTPS transport that injects X-Odoo-Database header for multi-DB routing
+    and bounds socket I/O with a timeout."""
 
-    def __init__(self, database: Optional[str] = None, **kwargs):
-        super().__init__(**kwargs)
+    # See OdooTransport.timeout_retry_safe
+    timeout_retry_safe: bool = True
+
+    def __init__(
+        self,
+        database: Optional[str] = None,
+        timeout: Optional[float] = None,
+        context: Optional[ssl.SSLContext] = None,
+        **kwargs,
+    ):
+        super().__init__(context=context, **kwargs)
         self.database = database
+        self.timeout = timeout
+
+    def make_connection(self, host):
+        connection = super().make_connection(host)
+        if self.timeout is not None:
+            connection.timeout = self.timeout
+        return connection
 
     def send_headers(self, connection, headers):
         super().send_headers(connection, headers)
         if self.database:
             connection.putheader("X-Odoo-Database", self.database)
 
+    request = _retry_once_request
+
 
 class ConnectionPool:
-    """Thread-safe connection pool for XML-RPC connections."""
+    """Per-endpoint ServerProxy factory.
 
-    def __init__(self, config: OdooConfig, max_connections: int = 10):
-        """Initialize connection pool.
+    Despite the name this is a factory, not a pool: proxies are created
+    at startup and held by OdooConnection for the server's lifetime.
+    Each proxy gets its own transport (xmlrpc Transport keep-alive state
+    races under concurrent calls) carrying the configured socket timeout
+    and the X-Odoo-Database header.
+    """
+
+    def __init__(self, config: OdooConfig, timeout: int = 30):
+        """Initialize the factory.
 
         Args:
             config: Odoo configuration
-            max_connections: Maximum number of connections
+            timeout: Socket timeout in seconds applied to every connection
         """
         self.config = config
-        self.max_connections = max_connections
-        self._connections: List[Tuple[ServerProxy, float]] = []
-        self._endpoint_map: List[str] = []  # Track endpoints for each connection
-        self._lock = threading.RLock()
-        # Use OdooSafeTransport/OdooTransport to support X-Odoo-Database header
-        if config.url.startswith("https://"):
-            self._transport: Union[OdooTransport, OdooSafeTransport] = OdooSafeTransport()
-        else:
-            self._transport = OdooTransport()
-        self._last_cleanup = time.time()
-        self._stats = {
-            "connections_created": 0,
-            "connections_reused": 0,
-            "connections_closed": 0,
-            "active_connections": 0,
-        }
+        self.timeout = timeout
+        self._database: Optional[str] = None
+        self._lock = threading.Lock()
+        self._connections_created = 0
+        # One SSL context shared by all HTTPS transports: amortizes context
+        # construction and lets TLS session tickets ride between the
+        # per-proxy keepalive sockets. ssl.SSLContext is documented
+        # thread-safe for use across connections; a future refactor that
+        # mutates it per-call would silently break this contract.
+        self._ssl_context: Optional[ssl.SSLContext] = (
+            ssl.create_default_context() if config.url.startswith("https://") else None
+        )
 
     def get_connection(self, endpoint: str) -> ServerProxy:
-        """Get a connection from the pool.
+        """Create a ServerProxy for an endpoint.
 
         Args:
             endpoint: The endpoint path (e.g., '/xmlrpc/2/common')
 
         Returns:
-            ServerProxy connection
+            ServerProxy connection with its own transport
         """
+        url = f"{self.config.url}{endpoint}"
         with self._lock:
-            now = time.time()
-
-            # Cleanup stale connections periodically
-            if now - self._last_cleanup > 60:  # Every minute
-                self._cleanup_stale_connections()
-                self._last_cleanup = now
-
-            # Try to find an existing connection
-            url = f"{self.config.url}{endpoint}"
-            for i, (conn, last_used) in enumerate(self._connections):
-                # Store endpoint with connection for matching
-                if i < len(self._endpoint_map) and self._endpoint_map[i] == endpoint:
-                    # Connection is still fresh (used within last 5 minutes)
-                    if now - last_used < 300:
-                        self._connections[i] = (conn, now)
-                        self._stats["connections_reused"] += 1
-                        logger.debug(f"Reusing connection for {endpoint}")
-                        return conn
-                    else:
-                        # Connection is stale, remove it
-                        self._connections.pop(i)
-                        self._endpoint_map.pop(i)
-                        self._stats["connections_closed"] += 1
-                        break
-
-            # Create new connection
-            if len(self._connections) >= self.max_connections:
-                # Remove oldest connection
-                self._connections.pop(0)
-                self._endpoint_map.pop(0)
-                self._stats["connections_closed"] += 1
-
-            conn = ServerProxy(url, transport=self._transport, allow_none=True)
-            self._connections.append((conn, now))
-            self._endpoint_map.append(endpoint)
-            self._stats["connections_created"] += 1
-            self._stats["active_connections"] = len(self._connections)
-            logger.debug(f"Created new connection for {endpoint}")
-            return conn
-
-    def _cleanup_stale_connections(self):
-        """Remove stale connections from pool."""
-        now = time.time()
-        initial_count = len(self._connections)
-
-        # Remove connections older than 5 minutes
-        new_connections = []
-        new_endpoints = []
-        for i, (conn, last_used) in enumerate(self._connections):
-            if now - last_used < 300:
-                new_connections.append((conn, last_used))
-                new_endpoints.append(self._endpoint_map[i])
-
-        self._connections = new_connections
-        self._endpoint_map = new_endpoints
-
-        removed = initial_count - len(self._connections)
-        if removed > 0:
-            self._stats["connections_closed"] += removed
-            self._stats["active_connections"] = len(self._connections)
-            logger.debug(f"Cleaned up {removed} stale connections")
-
-    def get_stats(self) -> Dict[str, Any]:
-        """Get connection pool statistics."""
-        with self._lock:
-            return self._stats.copy()
+            database = self._database
+            self._connections_created += 1
+        if self.config.url.startswith("https://"):
+            transport: Union[OdooTransport, OdooSafeTransport] = OdooSafeTransport(
+                database=database, timeout=self.timeout, context=self._ssl_context
+            )
+        else:
+            transport = OdooTransport(database=database, timeout=self.timeout)
+        logger.debug(f"Created new connection for {endpoint}")
+        return ServerProxy(url, transport=transport, allow_none=True)
 
     def set_database(self, db_name: str) -> None:
-        """Set the database for X-Odoo-Database header and invalidate existing connections.
+        """Set the database for the X-Odoo-Database header on new connections.
 
         Args:
             db_name: Database name to send in the header
         """
         with self._lock:
-            self._transport.database = db_name
-            # Invalidate existing connections — they were created without the header
-            self._stats["connections_closed"] += len(self._connections)
-            self._connections.clear()
-            self._endpoint_map.clear()
-            self._stats["active_connections"] = 0
-            logger.debug(f"Set database header to '{db_name}', cleared connection pool")
+            self._database = db_name
+        logger.debug(f"Set database header to '{db_name}'")
 
-    def clear(self):
-        """Clear all connections."""
+    def get_stats(self) -> Dict[str, Any]:
+        """Get connection factory statistics."""
         with self._lock:
-            self._stats["connections_closed"] += len(self._connections)
-            self._connections.clear()
-            self._endpoint_map.clear()
-            self._stats["active_connections"] = 0
-
-
-class RequestOptimizer:
-    """Optimizes Odoo requests for better performance."""
-
-    def __init__(self):
-        """Initialize request optimizer."""
-        self._batch_queue: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-        self._field_usage: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-        self._lock = threading.RLock()
-
-    def track_field_usage(self, model: str, fields: List[str]):
-        """Track which fields are commonly requested.
-
-        Args:
-            model: Model name
-            fields: List of field names
-        """
-        with self._lock:
-            for field in fields:
-                self._field_usage[model][field] += 1
-
-    def get_optimized_fields(self, model: str, requested_fields: Optional[List[str]]) -> List[str]:
-        """Get optimized field list based on usage patterns.
-
-        Args:
-            model: Model name
-            requested_fields: Explicitly requested fields
-
-        Returns:
-            Optimized field list
-        """
-        if requested_fields:
-            return requested_fields
-
-        with self._lock:
-            usage = self._field_usage.get(model, {})
-            if not usage:
-                # Return common fields if no usage data
-                # Use only universally available fields (not all models have 'name')
-                return ["id", "display_name"]
-
-            # Get top 20 most used fields
-            sorted_fields = sorted(usage.items(), key=lambda x: x[1], reverse=True)
-            return [field for field, _ in sorted_fields[:20]]
-
-    def should_batch_request(self, model: str, operation: str, size: int) -> bool:
-        """Determine if request should be batched.
-
-        Args:
-            model: Model name
-            operation: Operation type (read, search, etc.)
-            size: Number of records
-
-        Returns:
-            True if request should be batched
-        """
-        # Batch if requesting many records
-        if operation == "read" and size > 50:
-            return True
-
-        # Batch if multiple small requests for same model
-        with self._lock:
-            queue_size = len(self._batch_queue.get(f"{model}:{operation}", []))
-            return queue_size > 0
-
-    def add_to_batch(self, model: str, operation: str, params: Dict[str, Any]):
-        """Add request to batch queue.
-
-        Args:
-            model: Model name
-            operation: Operation type
-            params: Request parameters
-        """
-        with self._lock:
-            key = f"{model}:{operation}"
-            self._batch_queue[key].append(params)
-
-    def get_batch(self, model: str, operation: str) -> List[Dict[str, Any]]:
-        """Get and clear batch for processing.
-
-        Args:
-            model: Model name
-            operation: Operation type
-
-        Returns:
-            List of batched requests
-        """
-        with self._lock:
-            key = f"{model}:{operation}"
-            batch = self._batch_queue[key]
-            self._batch_queue[key] = []
-            return batch
+            return {"connections_created": self._connections_created}
 
 
 class PerformanceMonitor:
@@ -555,20 +502,18 @@ class PerformanceMonitor:
 class PerformanceManager:
     """Central manager for all performance optimizations."""
 
-    def __init__(self, config: OdooConfig):
+    def __init__(self, config: OdooConfig, timeout: int = 30):
         """Initialize performance manager.
 
         Args:
             config: Odoo configuration
+            timeout: Socket timeout in seconds for pooled connections
         """
         self.config = config
 
         # Initialize components
         self.field_cache = Cache(max_size=100, max_memory_mb=10)
-        self.record_cache = Cache(max_size=1000, max_memory_mb=50)
-        self.permission_cache = Cache(max_size=500, max_memory_mb=5)
-        self.connection_pool = ConnectionPool(config)
-        self.request_optimizer = RequestOptimizer()
+        self.connection_pool = ConnectionPool(config, timeout=timeout)
         self.monitor = PerformanceMonitor()
 
         logger.info("Performance manager initialized")
@@ -615,86 +560,6 @@ class PerformanceManager:
         # Fields rarely change, cache for 1 hour
         self.field_cache.put(key, fields, ttl_seconds=3600)
 
-    def get_cached_record(
-        self, model: str, record_id: int, fields: Optional[List[str]] = None
-    ) -> Optional[Dict[str, Any]]:
-        """Get cached record.
-
-        Args:
-            model: Model name
-            record_id: Record ID
-            fields: Field list (for cache key)
-
-        Returns:
-            Cached record or None
-        """
-        key = self.cache_key("record", model=model, id=record_id, fields=fields)
-        return self.record_cache.get(key)
-
-    def cache_record(
-        self,
-        model: str,
-        record: Dict[str, Any],
-        fields: Optional[List[str]] = None,
-        ttl_seconds: int = 300,
-    ):
-        """Cache record data.
-
-        Args:
-            model: Model name
-            record: Record data
-            fields: Field list (for cache key)
-            ttl_seconds: Cache TTL
-        """
-        record_id = record.get("id")
-        if record_id is not None:
-            key = self.cache_key("record", model=model, id=record_id, fields=fields)
-            self.record_cache.put(key, record, ttl_seconds=ttl_seconds)
-
-    def invalidate_record_cache(self, model: str, record_id: Optional[int] = None):
-        """Invalidate record cache.
-
-        Args:
-            model: Model name
-            record_id: Specific record ID or None for all model records
-        """
-        if record_id:
-            # Use wildcard pattern that will match any fields value
-            pattern = f"record:*id:{record_id}:model:{model}*"
-        else:
-            pattern = f"record:*model:{model}*"
-
-        count = self.record_cache.invalidate_pattern(pattern)
-        if count > 0:
-            logger.debug(f"Invalidated {count} cache entries for {pattern}")
-
-    def get_cached_permission(self, model: str, operation: str, user_id: int) -> Optional[bool]:
-        """Get cached permission check.
-
-        Args:
-            model: Model name
-            operation: Operation type
-            user_id: User ID
-
-        Returns:
-            Cached permission or None
-        """
-        key = self.cache_key("permission", model=model, operation=operation, user_id=user_id)
-        return self.permission_cache.get(key)
-
-    def cache_permission(self, model: str, operation: str, user_id: int, allowed: bool):
-        """Cache permission check result.
-
-        Args:
-            model: Model name
-            operation: Operation type
-            user_id: User ID
-            allowed: Permission result
-        """
-        key = self.cache_key("permission", model=model, operation=operation, user_id=user_id)
-        # Permissions may change, cache for 5 minutes
-        self.permission_cache.put(key, allowed, ttl_seconds=300)
-
     def get_optimized_connection(self, endpoint: str) -> Any:
         """Get optimized connection from pool.
 
@@ -707,29 +572,11 @@ class PerformanceManager:
         with self.monitor.track_operation("connection_get"):
             return self.connection_pool.get_connection(endpoint)
 
-    def optimize_search_fields(
-        self, model: str, requested_fields: Optional[List[str]] = None
-    ) -> List[str]:
-        """Optimize field selection for search.
-
-        Args:
-            model: Model name
-            requested_fields: Explicitly requested fields
-
-        Returns:
-            Optimized field list
-        """
-        optimized = self.request_optimizer.get_optimized_fields(model, requested_fields)
-        self.request_optimizer.track_field_usage(model, optimized)
-        return optimized
-
     def get_stats(self) -> Dict[str, Any]:
         """Get comprehensive performance statistics."""
         return {
             "caches": {
                 "field_cache": self.field_cache.get_stats(),
-                "record_cache": self.record_cache.get_stats(),
-                "permission_cache": self.permission_cache.get_stats(),
             },
             "connection_pool": self.connection_pool.get_stats(),
             "performance": self.monitor.get_stats(),
@@ -746,6 +593,4 @@ class PerformanceManager:
     def clear_all_caches(self):
         """Clear all caches."""
         self.field_cache.clear()
-        self.record_cache.clear()
-        self.permission_cache.clear()
         logger.info("All caches cleared")

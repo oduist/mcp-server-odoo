@@ -13,8 +13,6 @@ import pytest
 from mcp_server_odoo.config import OdooConfig
 from mcp_server_odoo.odoo_connection import OdooConnection, OdooConnectionError
 
-from .conftest import ODOO_SERVER_AVAILABLE
-
 
 class TestDatabaseDiscovery:
     """Test database discovery and auto-selection functionality."""
@@ -268,7 +266,6 @@ class TestDatabaseDiscovery:
 
 
 @pytest.mark.yolo
-@pytest.mark.skipif(not ODOO_SERVER_AVAILABLE, reason="Odoo server not available")
 class TestDatabaseDiscoveryIntegration:
     """Integration tests with real Odoo server."""
 
@@ -310,17 +307,25 @@ class TestDatabaseDiscoveryIntegration:
             assert conn.database_exists(selected)
 
     def test_real_validate_access(self, real_config):
-        """Test database access validation on real server."""
+        """Validation grants access to a real database and denies a missing one."""
         with OdooConnection(real_config) as conn:
-            # Get a database to test
             databases = conn.list_databases()
-            if databases:
-                db_name = databases[0]
+            assert databases, "server must expose at least one database"
 
-                # Should be able to validate access
-                result = conn.validate_database_access(db_name)
-                assert isinstance(result, bool)
-                print(f"Access to '{db_name}': {result}")
+            # The auto-selectable database must validate as accessible
+            selected = conn.auto_select_database()
+            assert conn.validate_database_access(selected) is True
+
+            # A nonexistent database must never validate. The API-key path
+            # reports False; the credentials path raises for unknown DBs —
+            # either way access is denied
+            missing = "no_such_database_mcp_test"
+            assert missing not in databases
+            try:
+                result = conn.validate_database_access(missing)
+            except OdooConnectionError:
+                result = False
+            assert result is False
 
 
 if __name__ == "__main__":

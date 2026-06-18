@@ -4,12 +4,15 @@ This module handles loading and validation of environment variables
 for connecting to Odoo via XML-RPC.
 """
 
+import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Literal, Optional
 
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -39,8 +42,19 @@ class OdooConfig:
     auth_token: Optional[str] = None  # Bearer token for HTTP transport auth
     server_url: Optional[str] = None  # Public URL of this MCP server (for OAuth metadata)
 
+    # Idle seconds before a streamable-http session is evicted (None = never).
+    # Without it, abandoned sessions pin their transport state (streams,
+    # task, server instance) in the session manager until process restart.
+    session_idle_timeout: Optional[float] = None
+
     # YOLO mode configuration
     yolo_mode: str = "off"  # "off", "read", or "true"
+
+    # Opt-in for call_model_method (effective only with yolo_mode == "true").
+    enable_method_calls: bool = False
+
+    # Allowed hosts for DNS rebinding protection (HTTP transport)
+    allowed_hosts: list[str] = field(default_factory=list)
 
     def __post_init__(self):
         """Validate configuration after initialization."""
@@ -113,6 +127,18 @@ class OdooConfig:
                 "Running HTTP transport without ODOO_MCP_AUTH_TOKEN. "
                 "The server will accept unauthenticated connections.",
                 stacklevel=2,
+            )
+
+        # Validate session idle timeout
+        if self.session_idle_timeout is not None and self.session_idle_timeout <= 0:
+            raise ValueError("ODOO_MCP_SESSION_IDLE_TIMEOUT must be positive")
+
+        # Without this warning, the silent non-registration is hard to debug.
+        if self.enable_method_calls and self.yolo_mode != "true":
+            logger.warning(
+                "ODOO_MCP_ENABLE_METHOD_CALLS=true ignored: requires ODOO_YOLO=true "
+                "(full YOLO mode); current yolo_mode=%r",
+                self.yolo_mode,
             )
 
     @property
@@ -216,6 +242,21 @@ def load_config(env_file: Optional[Path] = None) -> OdooConfig:
         except ValueError:
             raise ValueError(f"{key} must be a valid integer") from None
 
+    def get_optional_float_env(key: str) -> Optional[float]:
+        value = os.getenv(key)
+        if value is None or not value.strip():
+            return None
+        try:
+            return float(value)
+        except ValueError:
+            raise ValueError(f"{key} must be a valid number") from None
+
+    def get_bool_env(key: str, default: bool = False) -> bool:
+        raw = os.getenv(key)
+        if raw is None:
+            return default
+        return raw.strip().lower() in {"true", "1", "yes"}
+
     # Helper function to parse YOLO mode
     def get_yolo_mode() -> str:
         yolo_env = os.getenv("ODOO_YOLO", "off").strip().lower()
@@ -229,6 +270,13 @@ def load_config(env_file: Optional[Path] = None) -> OdooConfig:
         else:
             # Invalid value - will be caught by validation
             return yolo_env
+
+    # Helper function to parse allowed hosts
+    def parse_allowed_hosts() -> list[str]:
+        hosts = os.getenv("ODOO_MCP_ALLOWED_HOSTS", "").strip()
+        if not hosts:
+            return []
+        return [h.strip() for h in hosts.split(",") if h.strip()]
 
     # Create configuration
     config = OdooConfig(
@@ -246,8 +294,11 @@ def load_config(env_file: Optional[Path] = None) -> OdooConfig:
         port=get_int_env("ODOO_MCP_PORT", 8000),
         auth_token=os.getenv("ODOO_MCP_AUTH_TOKEN", "").strip() or None,
         server_url=os.getenv("ODOO_MCP_SERVER_URL", "").strip() or None,
+        session_idle_timeout=get_optional_float_env("ODOO_MCP_SESSION_IDLE_TIMEOUT"),
         locale=os.getenv("ODOO_LOCALE", "").strip() or None,
         yolo_mode=get_yolo_mode(),
+        enable_method_calls=get_bool_env("ODOO_MCP_ENABLE_METHOD_CALLS", False),
+        allowed_hosts=parse_allowed_hosts(),
     )
 
     return config

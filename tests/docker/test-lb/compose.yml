@@ -1,0 +1,35 @@
+# Test sidecar for issue #68 keepalive testing.
+#
+# Sits in front of the dev Odoo (running in another compose, exposed on host
+# port 8070) and terminates client-side HTTP keepalive — which is what makes
+# the half-open keepalive scenario reproducible locally. Werkzeug's --dev=all
+# server sends Connection: close on every response, so without this layer the
+# client never holds a keepalive socket.
+#
+# Usage:
+#   docker compose -f tests/docker/test-lb/compose.yml up -d
+#   uv run pytest tests/test_keepalive_recovery_e2e.py -m yolo -v
+#   docker compose -f tests/docker/test-lb/compose.yml down
+#
+# The integration tests in test_keepalive_recovery_e2e.py auto-detect this
+# LB at http://localhost:8090 and skip LB-dependent tests if it's not up.
+
+services:
+  test-lb:
+    image: nginx:alpine
+    container_name: mcp-test-lb
+    ports:
+      - "8090:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    extra_hosts:
+      # host.docker.internal works out of the box on Docker Desktop (macOS,
+      # Windows). On Linux, host-gateway resolves to the bridge gateway IP
+      # so the dev Odoo's host:8070 mapping is reachable.
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost/xmlrpc/2/common || exit 1"]
+      interval: 5s
+      timeout: 2s
+      retries: 3

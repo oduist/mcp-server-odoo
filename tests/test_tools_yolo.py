@@ -289,6 +289,42 @@ class TestYoloModeTools:
         assert len(ir_whitelist) == 1, "Should have exactly one 'model in [...]' whitelist"
         assert "ir.attachment" in ir_whitelist[0][2]
 
+        # Evaluate the prefix-notation domain to prove it actually filters
+        # (the previous OR-of-two-not-likes collapsed to transient=False).
+        def evaluate(dom, record):
+            def leaf(term):
+                field, op, value = term
+                actual = record[field]
+                if op == "=":
+                    return actual == value
+                if op == "not like":
+                    return not actual.startswith(value.rstrip("%"))
+                if op == "in":
+                    return actual in value
+                raise AssertionError(f"unexpected operator {op}")
+
+            def consume(i):
+                token = dom[i]
+                if token == "&":
+                    left, i = consume(i + 1)
+                    right, i = consume(i)
+                    return left and right, i
+                if token == "|":
+                    left, i = consume(i + 1)
+                    right, i = consume(i)
+                    return left or right, i
+                return leaf(token), i + 1
+
+            result, end = consume(0)
+            assert end == len(dom), "domain has dangling terms"
+            return result
+
+        assert evaluate(domain, {"model": "res.partner", "transient": False})
+        assert evaluate(domain, {"model": "ir.attachment", "transient": False})
+        assert not evaluate(domain, {"model": "ir.cron", "transient": False})
+        assert not evaluate(domain, {"model": "base.language.export", "transient": False})
+        assert not evaluate(domain, {"model": "res.partner", "transient": True})
+
     @pytest.mark.asyncio
     async def test_yolo_mode_logging(
         self, config_yolo_read, mock_connection, mock_access_controller, mock_app, caplog

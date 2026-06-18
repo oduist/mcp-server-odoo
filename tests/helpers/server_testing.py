@@ -243,33 +243,3 @@ def assert_performance(operation: str, duration: float, max_duration: float) -> 
         raise AssertionError(
             f"{operation} took {duration:.3f}s, exceeding limit of {max_duration}s"
         )
-
-
-def create_test_env_file(test_dir: Path) -> Path:
-    """Create a test .env file with server configuration."""
-    import os
-
-    env_file = test_dir / ".env"
-
-    # Require environment variables to be set
-    if not os.getenv("ODOO_URL"):
-        raise ValueError("ODOO_URL environment variable not set. Please configure .env file.")
-
-    if not os.getenv("ODOO_API_KEY") and not os.getenv("ODOO_PASSWORD"):
-        raise ValueError("Neither ODOO_API_KEY nor ODOO_PASSWORD set. Please configure .env file.")
-
-    lines = [
-        f"ODOO_URL={os.getenv('ODOO_URL')}",
-        f"ODOO_DATABASE={os.getenv('ODOO_DB', '')}",
-        f"ODOO_MCP_LOG_LEVEL={os.getenv('ODOO_MCP_LOG_LEVEL', 'INFO')}",
-    ]
-    if os.getenv("ODOO_API_KEY"):
-        lines.append(f"ODOO_API_KEY={os.getenv('ODOO_API_KEY')}")
-    if os.getenv("ODOO_USER"):
-        lines.append(f"ODOO_USER={os.getenv('ODOO_USER')}")
-    if os.getenv("ODOO_PASSWORD"):
-        lines.append(f"ODOO_PASSWORD={os.getenv('ODOO_PASSWORD')}")
-    env_content = "\n".join(lines)
-
-    env_file.write_text(env_content.strip())
-    return env_file
