@@ -82,36 +82,47 @@ class TestMCPProtocolCompliance:
 
     @pytest.mark.asyncio
     async def test_resource_listing_format(self, test_env):
-        """Test that list_resources returns a list; if non-empty, validate URIs."""
+        """Test that the server advertises its odoo:// resource templates."""
         client = MCPTestClient()
         async with client.connect() as connected_client:
+            # The server's resource surface is URI templates — they must
+            # always be advertised
+            result = await connected_client.session.list_resource_templates()
+            templates = {t.uriTemplate for t in result.resourceTemplates}
+            for expected in (
+                "odoo://{model}/record/{record_id}",
+                "odoo://{model}/search",
+                "odoo://{model}/count",
+                "odoo://{model}/fields",
+            ):
+                assert expected in templates, f"Missing template: {expected}"
+
+            # Concrete (non-template) resources may legitimately be absent,
+            # but any returned must be well-formed
             resources = await connected_client.list_resources()
             assert isinstance(resources, list)
-
-            # FastMCP may return an empty list due to resource template limitations.
-            # When resources are present, validate their format.
             for resource in resources:
                 assert isinstance(resource, Resource)
-                assert resource.uri.startswith("odoo://"), f"Bad URI: {resource.uri}"
+                assert str(resource.uri).startswith("odoo://"), f"Bad URI: {resource.uri}"
                 assert resource.name, f"Resource {resource.uri} has no name"
 
     @pytest.mark.asyncio
     async def test_read_resource_success(self, test_env):
-        """Test reading a record resource returns non-empty content."""
+        """Test reading a record resource returns the formatted record."""
         client = MCPTestClient()
         async with client.connect() as connected_client:
-            # Search for a real record
+            # Find a real record id via the search tool's structured output
             search_result = await connected_client.call_tool(
                 "search_records", {"model": "res.partner", "domain": [], "limit": 1}
             )
+            records = search_result.structuredContent["records"]
+            assert records, "test database must contain at least one res.partner"
+            record_id = records[0]["id"]
 
-            assert search_result.content, "search_records returned no content"
-            first = search_result.content[0]
-            assert isinstance(first, TextContent), f"Expected TextContent, got {type(first)}"
-
-            # The formatted output should contain record data
-            text = first.text
-            assert len(text) > 0, "search_records returned empty text"
+            # Read the record resource and verify it is that record
+            text = await connected_client.read_resource(f"odoo://res.partner/record/{record_id}")
+            assert f"Record: res.partner/{record_id}" in text
+            assert "Name:" in text
 
     @pytest.mark.asyncio
     async def test_read_resource_not_found(self, test_env):

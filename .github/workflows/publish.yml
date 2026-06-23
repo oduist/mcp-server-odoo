@@ -3,7 +3,12 @@ name: Publish to PyPI
 on:
   release:
     types: [published]
-  workflow_dispatch:  # Allow manual triggering
+  workflow_dispatch:
+    inputs:
+      confirm_version:
+        description: "Exact version to publish (must match pyproject.toml; typed confirmation guards against dispatching from the wrong branch)"
+        required: true
+        type: string
 
 jobs:
   publish:
@@ -33,10 +38,35 @@ jobs:
       run: |
         python -m build
         ls -la dist/
-    
+
     - name: Check package with twine
       run: |
         twine check --strict dist/*
+
+    # Guard against publishing the wrong code:
+    # - release: the built version must match the release tag (vX.Y.Z)
+    # - manual dispatch: the typed version must match the built version,
+    #   so an accidental dispatch from a branch with an in-progress bump
+    #   cannot publish unreviewed code
+    - name: Verify version matches release tag
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        RELEASE_TAG: ${{ github.event.release.tag_name }}
+        CONFIRMED_VERSION: ${{ inputs.confirm_version }}
+      run: |
+        BUILT_VERSION=$(python -c "import re,pathlib; print(re.search(r'^version = \"([^\"]+)\"', pathlib.Path('pyproject.toml').read_text(), re.M).group(1))")
+        echo "Built version: $BUILT_VERSION"
+        if [ "$EVENT_NAME" = "release" ]; then
+          EXPECTED="${RELEASE_TAG#v}"
+          SOURCE="release tag '$RELEASE_TAG'"
+        else
+          EXPECTED="$CONFIRMED_VERSION"
+          SOURCE="workflow_dispatch confirm_version input"
+        fi
+        if [ "$BUILT_VERSION" != "$EXPECTED" ]; then
+          echo "::error::Version mismatch: built '$BUILT_VERSION' but $SOURCE expects '$EXPECTED'. Refusing to publish."
+          exit 1
+        fi
     
     - name: Publish to PyPI
       uses: pypa/gh-action-pypi-publish@release/v1

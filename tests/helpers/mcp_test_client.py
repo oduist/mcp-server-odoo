@@ -15,6 +15,7 @@ from mcp.types import (
     CallToolResult,
     Resource,
     TextContent,
+    TextResourceContents,
     Tool,
 )
 
@@ -86,10 +87,11 @@ class MCPTestClient:
 
         result = await self.session.read_resource(uri)
 
-        # Extract text content
+        # Extract text content (resource reads return TextResourceContents,
+        # not the TextContent type used by tool results)
         if result.contents:
             for content in result.contents:
-                if isinstance(content, TextContent):
+                if isinstance(content, TextResourceContents):
                     return content.text
 
         return ""

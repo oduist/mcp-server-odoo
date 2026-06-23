@@ -399,7 +399,7 @@ class TestServerIntegration:
     """Integration tests with real .env configuration."""
 
     @pytest.mark.mcp
-    def test_server_with_env_file(self, tmp_path, monkeypatch):
+    def test_server_with_env_file(self, tmp_path):
         """Test server initialization with .env file in isolated environment."""
         # Import modules we need
         from mcp_server_odoo.config import load_config, reset_config
@@ -416,36 +416,40 @@ ODOO_DB=test_integration_db
 ODOO_MCP_LOG_LEVEL=DEBUG
 """)
 
+        # patch.dict snapshots os.environ and rolls back everything on exit,
+        # including keys that load_dotenv adds (monkeypatch.delenv on an
+        # absent key registers nothing to restore, so those would leak)
         try:
-            # Change to temp directory to isolate from project .env
-            os.chdir(tmp_path)
+            with patch.dict(os.environ):
+                # Change to temp directory to isolate from project .env
+                os.chdir(tmp_path)
 
-            # Clear all environment variables that might interfere
-            for key in [
-                "ODOO_URL",
-                "ODOO_API_KEY",
-                "ODOO_DB",
-                "ODOO_MCP_LOG_LEVEL",
-                "ODOO_USER",
-                "ODOO_PASSWORD",
-                "ODOO_YOLO",
-            ]:
-                monkeypatch.delenv(key, raising=False)
+                # Clear all environment variables that might interfere
+                for key in [
+                    "ODOO_URL",
+                    "ODOO_API_KEY",
+                    "ODOO_DB",
+                    "ODOO_MCP_LOG_LEVEL",
+                    "ODOO_USER",
+                    "ODOO_PASSWORD",
+                    "ODOO_YOLO",
+                ]:
+                    os.environ.pop(key, None)
 
-            # Reset config singleton
-            reset_config()
+                # Reset config singleton
+                reset_config()
 
-            # Load config explicitly from our test .env file
-            # This ensures we're loading from the tmp directory's .env
-            config = load_config(env_file)
+                # Load config explicitly from our test .env file
+                # This ensures we're loading from the tmp directory's .env
+                config = load_config(env_file)
 
-            # Create server with the loaded config
-            server = OdooMCPServer(config)
+                # Create server with the loaded config
+                server = OdooMCPServer(config)
 
-            assert server.config.url == "http://localhost:8069"
-            assert server.config.api_key == "test_integration_key"
-            assert server.config.database == "test_integration_db"
-            assert server.config.log_level == "DEBUG"
+                assert server.config.url == "http://localhost:8069"
+                assert server.config.api_key == "test_integration_key"
+                assert server.config.database == "test_integration_db"
+                assert server.config.log_level == "DEBUG"
 
         finally:
             os.chdir(original_cwd)
@@ -679,3 +683,351 @@ class TestFastMCPApp:
             health = server.get_health_status()
             assert health["status"] == "healthy"
             assert health["connection"]["connected"] is True
+
+
+class TestHttpExposureWarning:
+    """Non-loopback HTTP binds must produce a loud security warning."""
+
+    def _make_server(self, **config_overrides):
+        kwargs = {
+            "url": "http://localhost:8069",
+            "api_key": "test_api_key_12345",
+            "database": "test_db",
+        }
+        kwargs.update(config_overrides)
+        return OdooMCPServer(OdooConfig(**kwargs))
+
+    def test_warns_on_non_loopback_host(self):
+        server = self._make_server()
+        with patch("mcp_server_odoo.server.logger.warning") as mock_warning:
+            server._warn_if_exposed("0.0.0.0")
+        mock_warning.assert_called_once()
+        message = mock_warning.call_args[0][0]
+        assert "NO built-in" in message
+        assert "authentication" in message
+
+    def test_no_warning_on_loopback(self):
+        server = self._make_server()
+        with patch("mcp_server_odoo.server.logger.warning") as mock_warning:
+            server._warn_if_exposed("localhost")
+            server._warn_if_exposed("127.0.0.1")
+        mock_warning.assert_not_called()
+
+    def test_warning_escalates_in_yolo_full_mode(self):
+        server = self._make_server(
+            api_key=None, username="admin", password="admin", yolo_mode="true"
+        )
+        with patch("mcp_server_odoo.server.logger.warning") as mock_warning:
+            server._warn_if_exposed("0.0.0.0")
+        message = mock_warning.call_args[0][0]
+        assert "YOLO FULL-ACCESS MODE" in message
+
+
+class TestConnectionPersistsAcrossHttpSessions:
+    """Issue #70: streamable-http enters/exits the lifespan PER SESSION.
+
+    The Odoo connection and the registered handlers must survive session
+    teardown — previously every call after the first failed with
+    'Not authenticated with Odoo'.
+    """
+
+    def _make_server(self, transport):
+        config = OdooConfig(
+            url="http://localhost:8069",
+            api_key="test_api_key_12345",
+            database="test_db",
+            transport=transport,
+        )
+        with (
+            patch("mcp_server_odoo.server.OdooConnection") as conn_cls,
+            patch("mcp_server_odoo.server.AccessController"),
+            patch("mcp_server_odoo.server.register_resources") as reg_res,
+            patch("mcp_server_odoo.server.register_tools") as reg_tools,
+        ):
+            mock_connection = Mock()
+            mock_connection.is_authenticated = True
+            conn_cls.return_value = mock_connection
+            server = OdooMCPServer(config)
+            yield server, conn_cls, mock_connection, reg_res, reg_tools
+
+    @pytest.mark.asyncio
+    async def test_http_sessions_reuse_connection_and_registrations(self):
+        gen = self._make_server("streamable-http")
+        server, conn_cls, mock_connection, reg_res, reg_tools = next(gen)
+
+        # Session 1
+        async with server._odoo_lifespan(server.app):
+            pass
+        # Session 2 (e.g. after a DELETE /mcp) — must NOT disconnect or rebuild
+        async with server._odoo_lifespan(server.app):
+            pass
+
+        mock_connection.disconnect.assert_not_called()
+        assert conn_cls.call_count == 1, "connection must be created exactly once"
+        assert reg_res.call_count == 1, "resources must be registered exactly once"
+        assert reg_tools.call_count == 1, "tools must be registered exactly once"
+        assert server.connection is mock_connection, "connection survives session teardown"
+        assert server.access_controller is not None
+
+    @pytest.mark.asyncio
+    async def test_stdio_still_cleans_up_on_exit(self):
+        """stdio has one session per process — cleanup on exit stays correct."""
+        gen = self._make_server("stdio")
+        server, conn_cls, mock_connection, reg_res, reg_tools = next(gen)
+
+        async with server._odoo_lifespan(server.app):
+            assert server.connection is mock_connection
+
+        mock_connection.disconnect.assert_called_once()
+        assert server.connection is None
+
+    @pytest.mark.asyncio
+    async def test_stale_connection_reauthenticated_in_place(self):
+        """A connection that lost authentication is reconnected IN PLACE —
+        registered handlers hold references to it, so it must never be
+        replaced with a new instance."""
+        gen = self._make_server("streamable-http")
+        server, conn_cls, mock_connection, reg_res, reg_tools = next(gen)
+
+        async with server._odoo_lifespan(server.app):
+            pass
+
+        # Simulate auth loss between sessions
+        mock_connection.is_authenticated = False
+        mock_connection.is_connected = True
+
+        async with server._odoo_lifespan(server.app):
+            pass
+
+        assert conn_cls.call_count == 1, "must not build a new connection object"
+        mock_connection.authenticate.assert_called()
+        assert server.connection is mock_connection
+        # Reauth re-runs the api-key→password fallback chain — the controller
+        # must track the connection's EFFECTIVE auth method
+        assert server.access_controller.auth_method == mock_connection.auth_method
+
+    @pytest.mark.asyncio
+    async def test_recovery_after_failed_first_startup_registers_handlers(self):
+        """If the first startup fails after self.connection was assigned but
+        before auth succeeded, the next session's reauth must still create
+        the AccessController — without it, handler registration silently
+        skips and the recovered server serves zero tools while /health
+        reports healthy."""
+        gen = self._make_server("streamable-http")
+        server, conn_cls, mock_connection, reg_res, reg_tools = next(gen)
+
+        # Session 1: Odoo rejects auth — startup fails, half-built connection survives
+        mock_connection.is_authenticated = False
+        mock_connection.authenticate.side_effect = OdooConnectionError("auth failed")
+        with pytest.raises(OdooConnectionError):
+            async with server._odoo_lifespan(server.app):
+                pass
+        assert server.connection is mock_connection
+        assert server.access_controller is None
+
+        # Session 2: Odoo is back — reauth must recover a FULLY working server
+        mock_connection.authenticate.side_effect = None
+        mock_connection.is_connected = True
+        async with server._odoo_lifespan(server.app):
+            pass
+
+        assert server.access_controller is not None, (
+            "reauth recovery must create the access controller"
+        )
+        assert reg_res.call_count == 1, "resources must register after recovery"
+        assert reg_tools.call_count == 1, "tools must register after recovery"
+
+
+class TestTransportSecurity:
+    """Test transport security configuration for DNS rebinding protection."""
+
+    def test_no_transport_security_by_default(self):
+        """Test that no transport security is configured when allowed_hosts is empty."""
+        config = OdooConfig(
+            url="http://localhost:8069",
+            api_key="test_api_key",
+            allowed_hosts=[],
+        )
+        server = OdooMCPServer(config)
+
+        # FastMCP should not have transport_security set
+        # We check via the settings or internal state
+        assert server.app.settings.host == "localhost"
+
+    def test_transport_security_with_single_host(self):
+        """Test transport security is configured with a single allowed host."""
+        config = OdooConfig(
+            url="http://localhost:8069",
+            api_key="test_api_key",
+            allowed_hosts=["localhost"],
+        )
+        server = OdooMCPServer(config)
+
+        # Server should be created successfully with transport security
+        assert server.app is not None
+        assert server.config.allowed_hosts == ["localhost"]
+
+    def test_transport_security_with_multiple_hosts(self):
+        """Test transport security with multiple allowed hosts."""
+        config = OdooConfig(
+            url="http://localhost:8069",
+            api_key="test_api_key",
+            allowed_hosts=["localhost", "example.com", "odoo.local"],
+        )
+        server = OdooMCPServer(config)
+
+        assert server.app is not None
+        assert len(server.config.allowed_hosts) == 3
+
+    def test_transport_security_host_with_port_preserved(self):
+        """Test that hosts with ports are preserved as-is."""
+        config = OdooConfig(
+            url="http://localhost:8069",
+            api_key="test_api_key",
+            allowed_hosts=["localhost:8000", "example.com"],
+        )
+        server = OdooMCPServer(config)
+
+        # The server should handle both formats
+        assert "localhost:8000" in server.config.allowed_hosts
+        assert "example.com" in server.config.allowed_hosts
+
+    def test_transport_security_builds_allowed_origins(self):
+        """Test that allowed_origins are built from allowed_hosts."""
+        from mcp.server.transport_security import TransportSecuritySettings
+
+        config = OdooConfig(
+            url="http://localhost:8069",
+            api_key="test_api_key",
+            allowed_hosts=["example.com"],
+        )
+
+        # Capture the TransportSecuritySettings that would be created
+        with patch.object(TransportSecuritySettings, "__init__", return_value=None) as mock_init:
+            # Create server - this will call TransportSecuritySettings
+            OdooMCPServer(config)
+
+            # Verify TransportSecuritySettings was called with correct params
+            mock_init.assert_called_once()
+            call_kwargs = mock_init.call_args[1]
+
+            assert call_kwargs["enable_dns_rebinding_protection"] is True
+            assert "example.com:*" in call_kwargs["allowed_hosts"]
+            assert "http://example.com:*" in call_kwargs["allowed_origins"]
+            assert "https://example.com:*" in call_kwargs["allowed_origins"]
+
+    def test_transport_security_host_with_port_extracts_base(self):
+        """Test that base hostname is extracted from host:port for origins."""
+        from mcp.server.transport_security import TransportSecuritySettings
+
+        config = OdooConfig(
+            url="http://localhost:8069",
+            api_key="test_api_key",
+            allowed_hosts=["example.com:8080"],
+        )
+
+        with patch.object(TransportSecuritySettings, "__init__", return_value=None) as mock_init:
+            OdooMCPServer(config)
+
+            call_kwargs = mock_init.call_args[1]
+
+            # Host with port should be preserved as-is (already has port)
+            assert "example.com:8080" in call_kwargs["allowed_hosts"]
+            # Origins should use base hostname with wildcard port
+            assert "http://example.com:*" in call_kwargs["allowed_origins"]
+            assert "https://example.com:*" in call_kwargs["allowed_origins"]
+
+    def test_transport_security_not_configured_when_empty(self):
+        """Test we pass None as transport_security when allowed_hosts is empty."""
+        config = OdooConfig(
+            url="http://localhost:8069",
+            api_key="test_api_key",
+            allowed_hosts=[],
+        )
+
+        with patch("mcp_server_odoo.server.FastMCP") as mock_fastmcp:
+            mock_fastmcp.return_value = Mock()
+            OdooMCPServer(config)
+
+            # Verify FastMCP was called with transport_security=None
+            call_kwargs = mock_fastmcp.call_args[1]
+            assert call_kwargs.get("transport_security") is None
+
+    def test_build_transport_security_returns_none_without_hosts(self):
+        """Empty allowed_hosts → None, leaving the SDK default (protection off)."""
+        server = OdooMCPServer(
+            OdooConfig(url="http://localhost:8069", api_key="k", allowed_hosts=[])
+        )
+        assert server._build_transport_security() is None
+
+    def test_build_transport_security_settings_shape(self):
+        """Configured hosts produce wildcard-port hosts and http/https origins;
+        a host that already carries a port keeps it verbatim."""
+        server = OdooMCPServer(
+            OdooConfig(
+                url="http://localhost:8069",
+                api_key="k",
+                allowed_hosts=["odoo.example.com", "localhost:9000"],
+            )
+        )
+        settings = server._build_transport_security()
+
+        assert settings is not None
+        assert settings.enable_dns_rebinding_protection is True
+        # bare host gets :*, host:port is preserved as-is
+        assert settings.allowed_hosts == ["odoo.example.com:*", "localhost:9000"]
+        # origins use the base hostname (port stripped) on both schemes
+        assert settings.allowed_origins == [
+            "http://odoo.example.com:*",
+            "https://odoo.example.com:*",
+            "http://localhost:*",
+            "https://localhost:*",
+        ]
+
+
+class TestSessionIdleTimeoutPreseed:
+    """Test the session-manager pre-seed that applies the idle timeout."""
+
+    def test_no_preseed_without_timeout(self):
+        """Without the setting, the session manager is left for FastMCP to create."""
+        server = OdooMCPServer(OdooConfig(url="http://localhost:8069", api_key="k"))
+
+        server._preseed_session_manager()
+
+        assert server.app._session_manager is None
+
+    def test_preseed_applies_timeout_and_security(self):
+        """The pre-seeded manager carries the timeout and mirrors FastMCP's settings."""
+        from mcp.server.streamable_http_manager import StreamableHTTPSessionManager
+
+        server = OdooMCPServer(
+            OdooConfig(
+                url="http://localhost:8069",
+                api_key="k",
+                allowed_hosts=["localhost"],
+                session_idle_timeout=600,
+            )
+        )
+
+        server._preseed_session_manager()
+
+        manager = server.app._session_manager
+        assert isinstance(manager, StreamableHTTPSessionManager)
+        assert manager.session_idle_timeout == 600
+        assert manager.security_settings is server.app.settings.transport_security
+        assert manager.stateless is server.app.settings.stateless_http
+
+    def test_fastmcp_reuses_preseeded_manager(self):
+        """streamable_http_app() must use the pre-seeded manager, not build its own.
+
+        This is the load-bearing assumption of the workaround; if a FastMCP
+        upgrade changes the lazy initialization, this test fails loudly."""
+        server = OdooMCPServer(
+            OdooConfig(url="http://localhost:8069", api_key="k", session_idle_timeout=30)
+        )
+
+        server._preseed_session_manager()
+        preseeded = server.app._session_manager
+        server.app.streamable_http_app()
+
+        assert server.app._session_manager is preseeded

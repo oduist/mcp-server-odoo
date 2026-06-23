@@ -8,11 +8,9 @@ from mcp.server.fastmcp import FastMCP
 from mcp_server_odoo.access_control import AccessControlError, AccessController
 from mcp_server_odoo.config import OdooConfig
 from mcp_server_odoo.error_handling import (
+    MCPPermissionError,
     NotFoundError,
     ValidationError,
-)
-from mcp_server_odoo.error_handling import (
-    PermissionError as MCPPermissionError,
 )
 from mcp_server_odoo.odoo_connection import OdooConnection, OdooConnectionError
 from mcp_server_odoo.resources import OdooResourceHandler, register_resources
@@ -333,17 +331,19 @@ class TestResourceIntegration:
         handler = register_resources(app, connection, access_controller, test_config)
 
         try:
-            # Search for a partner record
+            # Search for a partner record. Base data guarantees partners
+            # exist — an empty result would mean the search itself broke,
+            # which must FAIL, not vacuously pass.
             partner_ids = connection.search("res.partner", [], limit=1)
+            assert partner_ids, "expected at least one res.partner record"
 
-            if partner_ids:
-                # Test retrieval
-                result = await handler._handle_record_retrieval("res.partner", str(partner_ids[0]))
+            # Test retrieval
+            result = await handler._handle_record_retrieval("res.partner", str(partner_ids[0]))
 
-                # Verify result format
-                assert f"Record: res.partner/{partner_ids[0]}" in result
-                assert "Name:" in result
-                assert "=" * 50 in result  # Separator line
+            # Verify result format
+            assert f"Record: res.partner/{partner_ids[0]}" in result
+            assert "Name:" in result
+            assert "=" * 50 in result  # Separator line
 
         finally:
             connection.disconnect()

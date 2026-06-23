@@ -7,6 +7,7 @@ system via REST API endpoints.
 import json
 import logging
 import re
+import threading
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -20,6 +21,18 @@ logger = logging.getLogger(__name__)
 
 class AccessControlError(Exception):
     """Exception for access control failures."""
+
+    pass
+
+
+class AccessControlUnavailableError(AccessControlError):
+    """Permission could not be EVALUATED (infrastructure failure).
+
+    Distinct from a denial: a network outage or malformed response from
+    the /mcp/ REST endpoints means "could not verify", not "not allowed".
+    Callers should surface these as connection errors (retryable), never
+    as access denials. Still fails closed — operations do not proceed.
+    """
 
     pass
 
@@ -70,7 +83,11 @@ class AccessController:
     MODEL_ACCESS_ENDPOINT = "/mcp/models/{model}/access"
 
     def __init__(
-        self, config: OdooConfig, database: Optional[str] = None, cache_ttl: int = CACHE_TTL
+        self,
+        config: OdooConfig,
+        database: Optional[str] = None,
+        cache_ttl: int = CACHE_TTL,
+        auth_method: Optional[str] = None,
     ):
         """Initialize access controller.
 
@@ -78,12 +95,22 @@ class AccessController:
             config: OdooConfig with connection details and API key
             database: Resolved database name (needed for session auth when config.database is None)
             cache_ttl: Cache time-to-live in seconds
+            auth_method: How the connection actually authenticated ('api_key'
+                or 'password'). When the configured API key was rejected and
+                the connection fell back to password auth, permission checks
+                must use session auth too — not keep sending the dead key.
         """
         self.config = config
         self.database = database or config.database
         self.cache_ttl = cache_ttl
+        self.auth_method = auth_method
         self._cache: Dict[str, CacheEntry] = {}
         self._session_id: Optional[str] = None
+        # Checks run concurrently in asyncio.to_thread workers: the cache
+        # lock keeps entry get/set/clear consistent, the session lock makes
+        # session (re-)authentication single-flight instead of thrashing
+        self._cache_lock = threading.Lock()
+        self._session_lock = threading.Lock()
 
         # Parse base URL
         self.base_url = config.url.rstrip("/")
@@ -159,8 +186,9 @@ class AccessController:
 
     def _ensure_session(self) -> None:
         """Ensure a valid session exists for REST requests."""
-        if not self._session_id:
-            self._authenticate_session()
+        with self._session_lock:
+            if not self._session_id:
+                self._authenticate_session()
 
     def _make_request(self, endpoint: str, timeout: int = 30) -> Dict[str, Any]:
         """Make authenticated request to MCP REST API.
@@ -198,7 +226,11 @@ class AccessController:
         uses_session = False
 
         req = urllib.request.Request(url)
-        if self.config.api_key:
+        # Use the API key only when the connection actually authenticated
+        # with it (or auth_method is unknown). After a password fallback the
+        # configured key is known-rejected — sending it would 401 every check.
+        use_api_key = self.config.api_key and self.auth_method != "password"
+        if use_api_key:
             req.add_header("X-API-Key", self.config.api_key)
         elif self.config.uses_credentials:
             self._ensure_session()
@@ -226,10 +258,11 @@ class AccessController:
                 # Session expired — retry once with a fresh session
                 if uses_session and allow_session_retry:
                     logger.info("Session expired, re-authenticating...")
-                    self._session_id = None
+                    with self._session_lock:
+                        self._session_id = None
                     return self._do_request(endpoint, timeout, allow_session_retry=False)
 
-                if self.config.api_key:
+                if use_api_key:
                     raise AccessControlError(
                         "API key rejected by MCP module. "
                         "Verify ODOO_API_KEY is valid and the MCP module is installed."
@@ -241,38 +274,41 @@ class AccessController:
             elif e.code == 403:
                 raise AccessControlError("Access denied to MCP endpoints") from e
             elif e.code == 404:
-                raise AccessControlError(f"Endpoint not found: {endpoint}") from e
+                raise AccessControlUnavailableError(f"Endpoint not found: {endpoint}") from e
             else:
-                raise AccessControlError(f"HTTP error {e.code}: {e.reason}") from e
+                raise AccessControlUnavailableError(f"HTTP error {e.code}: {e.reason}") from e
         except urllib.error.URLError as e:
-            raise AccessControlError(f"Connection error: {e.reason}") from e
+            raise AccessControlUnavailableError(f"Connection error: {e.reason}") from e
         except json.JSONDecodeError as e:
-            raise AccessControlError(f"Invalid JSON response: {e}") from e
+            raise AccessControlUnavailableError(f"Invalid JSON response: {e}") from e
         except AccessControlError:
             raise
         except Exception as e:
-            raise AccessControlError(f"Request failed: {e}") from e
+            raise AccessControlUnavailableError(f"Request failed: {e}") from e
 
     def _get_from_cache(self, key: str) -> Optional[Any]:
         """Get value from cache if not expired."""
-        if key in self._cache:
-            entry = self._cache[key]
-            if not entry.is_expired(self.cache_ttl):
-                logger.debug(f"Cache hit for {key}")
-                return entry.data
-            else:
-                logger.debug(f"Cache expired for {key}")
-                del self._cache[key]
+        with self._cache_lock:
+            if key in self._cache:
+                entry = self._cache[key]
+                if not entry.is_expired(self.cache_ttl):
+                    logger.debug(f"Cache hit for {key}")
+                    return entry.data
+                else:
+                    logger.debug(f"Cache expired for {key}")
+                    del self._cache[key]
         return None
 
     def _set_cache(self, key: str, data: Any) -> None:
         """Set value in cache."""
-        self._cache[key] = CacheEntry(data=data, timestamp=datetime.now())
+        with self._cache_lock:
+            self._cache[key] = CacheEntry(data=data, timestamp=datetime.now())
         logger.debug(f"Cached {key}")
 
     def clear_cache(self) -> None:
         """Clear all cached data."""
-        self._cache.clear()
+        with self._cache_lock:
+            self._cache.clear()
         logger.info("Cleared access control cache")
 
     def get_enabled_models(self) -> List[Dict[str, str]]:
@@ -440,6 +476,10 @@ class AccessController:
 
             return True, None
 
+        except AccessControlUnavailableError:
+            # Infrastructure failure — propagate so callers report a
+            # connection problem (retryable), not a permission denial
+            raise
         except AccessControlError as e:
             logger.error(f"Access control check failed: {e}")
             return False, str(e)

@@ -162,3 +162,91 @@ class TestErrorSanitizer:
 
         # Should contain useful information
         assert "Invalid field" in sanitized
+
+
+class TestTracebackReduction:
+    """Traceback-shaped messages must never leak server internals."""
+
+    UNIQUE_INDEX_FAULT = (
+        "Traceback (most recent call last):\n"
+        '  File "/opt/odoo/odoo/service/model.py", line 134, in retrying\n'
+        "    result = func()\n"
+        '  File "/opt/odoo/odoo/models.py", line 4567, in write\n'
+        "    self._write(vals)\n"
+        "psycopg2.errors.UniqueViolation: duplicate key value violates "
+        'unique constraint "res_partner_email_uniq"\n'
+        "DETAIL:  Key (email)=(secret@internal.corp) already exists.\n"
+    )
+
+    def test_unique_violation_leaks_nothing(self):
+        sanitized = ErrorSanitizer.sanitize_xmlrpc_fault(self.UNIQUE_INDEX_FAULT)
+        assert "res_partner_email_uniq" not in sanitized
+        assert "secret@internal.corp" not in sanitized
+        assert "/opt/odoo" not in sanitized
+        assert "_write" not in sanitized
+        assert sanitized == "A record with these values already exists"
+
+    def test_value_error_traceback_keeps_final_message_only(self):
+        fault = (
+            "Traceback (most recent call last):\n"
+            '  File "/opt/odoo/odoo/api.py", line 525, in _call_kw\n'
+            "    result = getattr(recs, method)(*args, **kwargs)\n"
+            "ValueError: Wrong value for res.partner.type: 'bogus'\n"
+        )
+        sanitized = ErrorSanitizer.sanitize_xmlrpc_fault(fault)
+        assert "/opt/odoo" not in sanitized
+        assert "_call_kw" not in sanitized
+        assert "Wrong value" in sanitized
+
+    def test_modern_user_error_message_preserved(self):
+        fault = (
+            "Traceback (most recent call last):\n"
+            '  File "/opt/odoo/odoo/models.py", line 99, in check\n'
+            "    raise UserError(msg)\n"
+            "odoo.exceptions.UserError: You cannot delete a posted invoice.\n"
+        )
+        sanitized = ErrorSanitizer.sanitize_xmlrpc_fault(fault)
+        assert sanitized == "You cannot delete a posted invoice."
+
+    def test_multiline_user_error_message_kept_intact(self):
+        """Business errors are often multi-line — reduction must keep the
+        whole final message, not just the last physical line."""
+        fault = (
+            "Traceback (most recent call last):\n"
+            '  File "/opt/odoo/odoo/models.py", line 99, in check\n'
+            "    raise UserError(msg)\n"
+            "odoo.exceptions.UserError: You cannot delete this invoice because:\n"
+            "- it is posted\n"
+            "- it has a payment attached\n"
+        )
+        sanitized = ErrorSanitizer.sanitize_xmlrpc_fault(fault)
+        assert "You cannot delete this invoice because:" in sanitized
+        assert "- it is posted" in sanitized
+        assert "- it has a payment attached" in sanitized
+        assert "/opt/odoo" not in sanitized
+        assert "raise UserError" not in sanitized
+
+    def test_missing_error_real_wording_no_placeholder(self):
+        # Odoo's actual MissingError wording carries no 'ID <n>' token
+        message = "Record res.partner(99,) does not exist or has been deleted"
+        sanitized = ErrorSanitizer.sanitize_message(message)
+        assert "{}" not in sanitized
+
+    def test_failed_to_execute_detail_preserved(self):
+        message = "Failed to execute search on res.partner: timeout"
+        sanitized = ErrorSanitizer.sanitize_message(message)
+        assert sanitized == "Operation failed: timeout"
+        assert "{}" not in sanitized
+
+    def test_no_mapping_ever_emits_placeholder(self):
+        """Property: no sanitizer output contains a literal '{}'."""
+        probes = [
+            "Record res.partner(7,) does not exist or has been deleted",
+            "Failed to execute write on crm.lead: boom",
+            "Invalid field in leaf",
+            "Unknown field in domain",
+            "Model does not exist",
+            "Record does not exist",
+        ]
+        for probe in probes:
+            assert "{}" not in ErrorSanitizer.sanitize_message(probe), probe

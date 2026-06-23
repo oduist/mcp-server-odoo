@@ -35,7 +35,15 @@ class ErrorSanitizer:
         # Stack traces
         (r"in\s+<[^>]+>", ""),
         (r"in\s+[a-zA-Z_]+\(\)", ""),
+        # Database driver internals
+        (r"psycopg2\.[a-zA-Z_.]+:", ""),
     ]
+
+    # Marker identifying traceback-shaped messages
+    TRACEBACK_MARKER = "Traceback (most recent call last)"
+
+    # Shape of the line that starts the final exception message in a traceback
+    _EXCEPTION_LINE_RE = re.compile(r"^[A-Za-z_][\w.]*(?:Error|Exception|Warning|Violation)\b")
 
     # Specific error message mappings
     ERROR_MAPPINGS = {
@@ -46,8 +54,14 @@ class ErrorSanitizer:
         # Model errors
         r"Model .+ does not exist": "Model '{}' is not available",
         r"Access denied on model": "You don't have permission to access this model",
+        # Database constraint errors (constraint names / values are internal)
+        r"duplicate key value violates unique constraint": (
+            "A record with these values already exists"
+        ),
+        r"violates foreign key constraint": "The record is referenced by other records",
+        r"violates not-null constraint": "A required value is missing",
         # Connection errors
-        r"Failed to execute .+ on .+: .+": "Operation failed: {}",
+        r"Failed to execute .+ on .+: (.+)": "Operation failed: {}",
         r"Connection refused": "Cannot connect to Odoo server",
         r"Operation timeout after \d+ seconds": "Request timed out",
         # Authentication errors
@@ -74,6 +88,11 @@ class ErrorSanitizer:
         if not message:
             return "An error occurred"
 
+        # Traceback-shaped messages carry source lines, SQL constraint
+        # names and data values — reduce to the final exception message
+        # before any other processing.
+        message = cls._reduce_traceback(message)
+
         sanitized = message
 
         # First, try to match against known error patterns
@@ -88,6 +107,8 @@ class ErrorSanitizer:
                     extracted = cls._extract_relevant_info(message, pattern)
                     if extracted:
                         return replacement.format(extracted)
+                    # Extraction failed — never return a literal '{}'
+                    return cls._strip_placeholder(replacement)
                 return replacement
 
         # Remove patterns that expose internals
@@ -106,6 +127,47 @@ class ErrorSanitizer:
             sanitized = sanitized[0].upper() + sanitized[1:]
 
         return sanitized
+
+    @classmethod
+    def _reduce_traceback(cls, message: str) -> str:
+        """Reduce a traceback-shaped message to its final exception message.
+
+        Intermediate traceback lines expose source code, file structure,
+        constraint names and data values — only the final exception message
+        is user-relevant. Odoo business errors (UserError etc.) are often
+        multi-line, so everything from the exception line to the end is
+        kept, not just the last physical line.
+        """
+        if cls.TRACEBACK_MARKER not in message:
+            return message
+
+        lines = [line.strip() for line in message.splitlines() if line.strip()]
+        # Drop trailing Postgres diagnostics (they carry column names and values)
+        while lines and re.match(r"^(DETAIL|HINT|CONTEXT|LINE \d)", lines[-1], re.IGNORECASE):
+            lines.pop()
+        if not lines:
+            return "An error occurred"
+
+        # The final exception message starts at the first exception-shaped
+        # line after the last traceback frame; fall back to the last line.
+        last_frame = max(
+            (i for i, line in enumerate(lines) if line.startswith('File "')), default=-1
+        )
+        tail = lines[last_frame + 1 :]
+        exc_idx = next(
+            (i for i, line in enumerate(tail) if cls._EXCEPTION_LINE_RE.match(line)),
+            len(tail) - 1,
+        )
+        final = "\n".join(tail[exc_idx:])
+        # Strip inline DETAIL appended to the exception message
+        final = re.split(r"\s+DETAIL:", final)[0].strip()
+        return final or "An error occurred"
+
+    @classmethod
+    def _strip_placeholder(cls, replacement: str) -> str:
+        """Return the placeholder-free variant of a '{}' template."""
+        stripped = replacement.replace(": {}", "").replace(" '{}'", "").replace("{}", "")
+        return re.sub(r"\s+", " ", stripped).strip(" :'\"")
 
     @classmethod
     def _extract_relevant_info(cls, message: str, pattern: str) -> Optional[str]:
@@ -193,6 +255,9 @@ class ErrorSanitizer:
             "KeyError": "not_found",
             "NotFoundError": "not_found",
             "PermissionError": "permission_denied",
+            "MCPPermissionError": "permission_denied",
+            "MCPConnectionError": "connection_error",
+            "MCPSystemError": "internal_error",
             "AccessControlError": "access_denied",
             "AuthenticationError": "authentication_failed",
             "ConnectionError": "connection_error",
@@ -213,6 +278,10 @@ class ErrorSanitizer:
         Returns:
             Sanitized error message
         """
+        # Full server tracebacks in faultString: keep only the final
+        # exception message before classifying
+        fault_string = cls._reduce_traceback(fault_string)
+
         # Common Odoo XML-RPC faults
         if "Access Denied" in fault_string:
             return "Access denied: Invalid credentials or insufficient permissions"
@@ -231,10 +300,16 @@ class ErrorSanitizer:
         elif "ValidationError" in fault_string:
             return "Validation error: Please check your input"
         elif "UserError" in fault_string:
-            # Try to extract the user-friendly part of UserError
+            # Try to extract the user-friendly part of UserError:
+            # repr form UserError('msg') or modern odoo.exceptions.UserError: msg
             user_msg_match = re.search(r'UserError\(["\']([^"\']+)["\']', fault_string)
             if user_msg_match:
                 return user_msg_match.group(1)
+            # DOTALL: UserError messages are often multi-line ("You cannot
+            # delete X because:\n- reason 1\n- reason 2") — keep all of it
+            modern_match = re.search(r"(?:[\w.]+\.)?UserError:\s*(.+)", fault_string, re.DOTALL)
+            if modern_match:
+                return modern_match.group(1).strip()
             return "Operation failed due to business rule violation"
         else:
             # Generic sanitization

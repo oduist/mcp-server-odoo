@@ -19,6 +19,8 @@ An MCP server that enables AI assistants like Claude to interact with Odoo ERP s
 - 🗑️ **Delete records** respecting model-level permissions
 - 🔢 **Count records** matching specific criteria
 - 📋 **Inspect model fields** to understand data structure
+- 📊 **Server-side aggregation** — group, sum, and count without pulling raw rows
+- ⚡ **Workflow actions** — invoke any public Odoo method (post invoice, confirm SO, etc.) via an opt-in escape hatch
 - 🔐 **Secure access** with API key or username/password authentication
 - 🎯 **Smart pagination** for large datasets
 - 🧠 **Smart field selection** — automatically picks the most relevant fields per model
@@ -257,6 +259,8 @@ docker run --rm -p 8000:8000 \
   ivnvxd/mcp-server-odoo --transport streamable-http --host 0.0.0.0
 ```
 
+> ⚠️ **Security**: the HTTP transport has no built-in authentication — anyone who can reach the port gets Odoo access through the server's credentials. Publish the port only on trusted networks, or front it with an authenticating reverse proxy. See [Transport Options](#transport-options).
+
 The image is also available on GHCR: `ghcr.io/ivnvxd/mcp-server-odoo`
 </details>
 
@@ -301,6 +305,7 @@ The server requires the following environment variables:
 | `ODOO_DB` | No | Database name (auto-detected if not set) | `mycompany` |
 | `ODOO_LOCALE` | No | Language/locale for Odoo responses | `es_ES`, `fr_FR`, `de_DE` |
 | `ODOO_YOLO` | No | YOLO mode - bypasses MCP security (⚠️ DEV ONLY) | `off`, `read`, `true` |
+| `ODOO_MCP_ENABLE_METHOD_CALLS` | No | Enable the `call_model_method` tool — requires `ODOO_YOLO=true` (⚠️ Dangerous, see [`call_model_method`](#call_model_method)) | `false`, `true` |
 
 *Either `ODOO_API_KEY` or both `ODOO_USER` and `ODOO_PASSWORD` are required.
 
@@ -322,6 +327,8 @@ The server requires the following environment variables:
 | `ODOO_MCP_TRANSPORT` | `stdio` | Transport type (`stdio`, `streamable-http`) |
 | `ODOO_MCP_HOST` | `localhost` | Host to bind for HTTP transport |
 | `ODOO_MCP_PORT` | `8000` | Port to bind for HTTP transport |
+| `ODOO_MCP_ALLOWED_HOSTS` | — | Comma-separated `Host` headers to accept for HTTP transport (DNS-rebinding protection). Set when running `streamable-http` behind a reverse proxy that forwards an external host, e.g. `odoo.example.com,localhost`. Unset leaves the default (no host validation). |
+| `ODOO_MCP_SESSION_IDLE_TIMEOUT` | — | Seconds of inactivity before a `streamable-http` session is closed and its server-side state freed, e.g. `600`. Unset means sessions never expire. |
 
 ### Transport Options
 
@@ -338,8 +345,13 @@ uvx mcp-server-odoo
 #### 2. **streamable-http**
 Standard HTTP transport for REST API-style access and remote connectivity.
 
+> ⚠️ **Security**: this transport has **no built-in client authentication**. Any client that can reach the port can use every tool and resource with the Odoo credentials the server holds — including writes in YOLO full-access mode. Keep the default `localhost` bind unless the network is trusted, and front the server with an authenticating reverse proxy (e.g. nginx with basic auth or OAuth) for remote access. The server logs a warning when binding a non-loopback host.
+
 ```bash
-# Run with HTTP transport
+# Run with HTTP transport (localhost only — safe default)
+uvx mcp-server-odoo --transport streamable-http --port 8000
+
+# Binding 0.0.0.0 exposes the server to the network — see the security note above
 uvx mcp-server-odoo --transport streamable-http --host 0.0.0.0 --port 8000
 
 # Or use environment variables
@@ -516,6 +528,7 @@ Search for records in any Odoo model with filters.
 **Field Selection Options:**
 - Omit `fields` or set to `null`: Returns smart selection of common fields
 - Specify field list: Returns only those specific fields
+- An empty list `[]` is treated like `null` (smart defaults)
 - Use `["__all__"]`: Returns all fields (use with caution)
 
 ### `get_record`
@@ -532,6 +545,7 @@ Retrieve a specific record by ID.
 **Field Selection Options:**
 - Omit `fields` or set to `null`: Returns smart selection of common fields with metadata
 - Specify field list: Returns only those specific fields
+- An empty list `[]` is treated like `null` (smart defaults)
 - Use `["__all__"]`: Returns all fields without metadata
 
 ### `list_models`
@@ -583,6 +597,69 @@ Delete a record from Odoo.
 {
   "model": "res.partner",
   "record_id": 42
+}
+```
+
+### `post_message`
+Post a message to a record's chatter (`mail.thread`). `subtype="note"` (default) is an internal log; `subtype="comment"` notifies followers. Set `body_is_html=true` for HTML markup. Optional `partner_ids` and `attachment_ids` reference existing partners and attachments.
+
+```json
+{
+  "model": "res.partner",
+  "record_id": 42,
+  "body": "Called customer, will follow up Tuesday"
+}
+```
+
+```json
+{
+  "model": "sale.order",
+  "record_id": 17,
+  "body": "<p>Shipping confirmed for Monday</p>",
+  "subtype": "comment",
+  "body_is_html": true
+}
+```
+
+### `aggregate_records`
+Server-side aggregation. Use this whenever the question is "totals/counts/groupings" rather than "list of records" — it pushes the work down to PostgreSQL instead of pulling raw rows. Dispatches to `formatted_read_group` on Odoo 19+ (the new dedicated method) and falls back to `read_group` with response normalization on older versions. Callers see a consistent response shape on every supported version. When `aggregates` is omitted, defaults to `["__count"]` so each group always carries a count.
+
+```json
+{
+  "model": "sale.order",
+  "groupby": ["date_order:month"],
+  "aggregates": ["amount_total:sum"],
+  "domain": [["state", "in", ["sale", "done"]]]
+}
+```
+
+```json
+{
+  "model": "res.partner",
+  "groupby": ["country_id"]
+}
+```
+
+### `call_model_method`
+Generic XML-RPC `execute_kw` escape hatch — invokes any **public** method on any model, for workflow actions not covered by CRUD (post invoice, confirm sale order, validate picking, etc.). Available **only** when both `ODOO_YOLO=true` (full YOLO) and `ODOO_MCP_ENABLE_METHOD_CALLS=true` are set; otherwise the tool is not registered. Only public ASCII Python identifiers are accepted as method names — dotted, dashed, whitespace, non-ASCII, and `_`-prefixed names are rejected.
+
+> [!WARNING]
+> This tool can invoke **any** public method, including destructive ones (e.g. `unlink`, `button_draft`, custom workflow methods). Enable only in trusted environments where you accept the blast radius. Odoo's record rules and ACLs still apply for the authenticated user.
+
+```json
+{
+  "model": "account.move",
+  "method": "action_post",
+  "arguments": [[42]]
+}
+```
+
+```json
+{
+  "model": "sale.order",
+  "method": "action_confirm",
+  "arguments": [[7]],
+  "keyword_arguments": {"context": {"lang": "en_US"}}
 }
 ```
 

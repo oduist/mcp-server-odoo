@@ -58,19 +58,6 @@ class TestCreateOperation:
         assert args[5] == [{"name": "Test", "email": "t@example.com"}]
         assert args[6] == {}
 
-    def test_create_invalidates_model_cache(self, conn):
-        """create() should invalidate the record cache for the model."""
-        conn._object_proxy.execute_kw.return_value = 42
-
-        # Prime the cache
-        conn._performance_manager.cache_record("res.partner", {"id": 1, "name": "Old"})
-
-        conn.create("res.partner", {"name": "New"})
-
-        # Cache should be invalidated (model-wide)
-        cached = conn._performance_manager.get_cached_record("res.partner", 1)
-        assert cached is None
-
     def test_create_propagates_xmlrpc_fault(self, conn):
         """create() should wrap XML-RPC faults as OdooConnectionError."""
         conn._object_proxy.execute_kw.side_effect = xmlrpc.client.Fault(
@@ -103,21 +90,6 @@ class TestWriteOperation:
         assert args[4] == "write"
         assert args[5] == [[10, 20], {"email": "new@example.com"}]
 
-    def test_write_invalidates_cache_per_record(self, conn):
-        """write() should invalidate cache for each updated record."""
-        conn._object_proxy.execute_kw.return_value = True
-
-        conn._performance_manager.cache_record("res.partner", {"id": 1, "name": "Old1"})
-        conn._performance_manager.cache_record("res.partner", {"id": 2, "name": "Old2"})
-        conn._performance_manager.cache_record("res.partner", {"id": 3, "name": "Untouched"})
-
-        conn.write("res.partner", [1, 2], {"name": "Updated"})
-
-        assert conn._performance_manager.get_cached_record("res.partner", 1) is None
-        assert conn._performance_manager.get_cached_record("res.partner", 2) is None
-        # Record 3 was not in the write list — it should remain cached
-        assert conn._performance_manager.get_cached_record("res.partner", 3) is not None
-
     def test_write_propagates_xmlrpc_fault(self, conn):
         """write() should wrap XML-RPC faults as OdooConnectionError."""
         conn._object_proxy.execute_kw.side_effect = xmlrpc.client.Fault(
@@ -142,18 +114,6 @@ class TestUnlinkOperation:
         assert args[3] == "res.partner"
         assert args[4] == "unlink"
         assert args[5] == [[5, 6, 7]]
-
-    def test_unlink_invalidates_cache_per_record(self, conn):
-        """unlink() should invalidate cache for each deleted record."""
-        conn._object_proxy.execute_kw.return_value = True
-
-        conn._performance_manager.cache_record("res.partner", {"id": 5, "name": "Del"})
-        conn._performance_manager.cache_record("res.partner", {"id": 6, "name": "Del2"})
-
-        conn.unlink("res.partner", [5, 6])
-
-        assert conn._performance_manager.get_cached_record("res.partner", 5) is None
-        assert conn._performance_manager.get_cached_record("res.partner", 6) is None
 
     def test_unlink_propagates_xmlrpc_fault(self, conn):
         """unlink() should wrap XML-RPC faults as OdooConnectionError."""

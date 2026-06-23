@@ -432,3 +432,46 @@ class TestOdooConnectionIntegration:
                 raise
             assert isinstance(db_list, list)
             assert len(db_list) > 0
+
+
+class TestSensitiveValueRedaction:
+    """Write payload values must never reach log output in cleartext."""
+
+    def test_password_redacted_in_debug_log(self, caplog):
+        import logging
+
+        from mcp_server_odoo.config import OdooConfig
+        from mcp_server_odoo.odoo_connection import OdooConnection
+
+        config = OdooConfig(
+            url="http://localhost:8069",
+            username="admin",
+            password="admin",
+            database="testdb",
+        )
+        conn = OdooConnection(config)
+        conn._connected = True
+        conn._authenticated = True
+        conn._uid = 2
+        conn._database = "testdb"
+        conn._auth_method = "password"
+        conn._object_proxy = MagicMock()
+        conn._object_proxy.execute_kw.return_value = 42
+
+        with caplog.at_level(logging.DEBUG, logger="mcp_server_odoo.odoo_connection"):
+            conn.create(
+                "res.users",
+                {"name": "Bob", "login": "bob", "password": "S3cretPass!"},
+            )
+
+        assert "S3cretPass!" not in caplog.text
+        assert "***" in caplog.text
+        assert "Bob" in caplog.text  # non-sensitive values still visible
+
+    def test_long_strings_summarized(self):
+        from mcp_server_odoo.odoo_connection import _describe_args
+
+        blob = "A" * 5000
+        described = _describe_args([{"image_1920": blob, "name": "x"}])
+        assert described[0]["image_1920"] == "<str len=5000>"
+        assert described[0]["name"] == "x"

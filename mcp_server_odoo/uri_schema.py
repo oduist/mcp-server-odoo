@@ -7,7 +7,6 @@ pattern: odoo://{model}/{operation}?{parameters}
 Supported operations:
 - record/{id}: Fetch a specific record
 - search: Search for records using domain
-- browse: Retrieve multiple records by IDs
 - count: Count matching records
 - fields: Get field definitions
 """
@@ -24,7 +23,6 @@ class OdooOperation(Enum):
 
     RECORD = "record"
     SEARCH = "search"
-    BROWSE = "browse"
     COUNT = "count"
     FIELDS = "fields"
 
@@ -138,10 +136,6 @@ def parse_uri(uri: str) -> OdooURI:
     order = params.get("order")
     ids = _parse_ids_parameter(params.get("ids"))
 
-    # Validate operation-specific parameters
-    if operation == OdooOperation.BROWSE and not ids:
-        raise URIValidationError("Browse operation requires 'ids' parameter")
-
     return OdooURI(
         model=model,
         operation=operation,
@@ -170,14 +164,14 @@ def build_uri(
 
     Args:
         model: Odoo model name (e.g., "res.partner")
-        operation: Operation type (record, search, browse, count, fields)
+        operation: Operation type (record, search, count, fields)
         record_id: Record ID for record operation
         domain: Odoo domain expression (should be URL-encoded if needed)
         fields: List of field names to return
         limit: Maximum number of records
         offset: Pagination offset
         order: Sorting criteria
-        ids: List of IDs for browse operation
+        ids: List of record IDs
 
     Returns:
         Formatted URI string

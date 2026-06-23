@@ -1,18 +1,26 @@
 version: 2
 updates:
-  # Enable version updates for Python dependencies
-  - package-ecosystem: "pip"
+  # Enable version updates for Python dependencies (uv manages uv.lock;
+  # the "pip" ecosystem does not and produced zero Python dependency PRs)
+  - package-ecosystem: "uv"
     directory: "/"
+    # Development happens on dev; main only receives release merges.
+    # Without this, version-update PRs target the default branch (main)
+    # and manual retargeting desyncs Dependabot's metadata (its rebase/
+    # recreate commands keep acting against main). Security updates
+    # always target the default branch regardless of this setting.
+    target-branch: "dev"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 10
     labels:
       - "dependencies"
       - "python"
-    
+
   # Enable version updates for GitHub Actions
   - package-ecosystem: "github-actions"
     directory: "/"
+    target-branch: "dev"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5

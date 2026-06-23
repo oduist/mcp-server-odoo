@@ -1,6 +1,6 @@
 """Auth matrix integration tests — covers all credential combinations.
 
-Tests every auth scenario from docs/auth-test-matrix.md:
+Tests every auth scenario:
 - Standard mode (S1–S7): API key and/or user/pass, with/without DB
 - YOLO read (Y1–Y6): Various credential combos, writes blocked
 - YOLO full (F1–F6): Same as read, writes allowed
@@ -18,15 +18,6 @@ import pytest
 from mcp_server_odoo.access_control import AccessControlError, AccessController
 from mcp_server_odoo.config import OdooConfig
 from mcp_server_odoo.odoo_connection import OdooConnection
-
-from .conftest import ODOO_SERVER_AVAILABLE
-
-
-@pytest.fixture(autouse=True)
-def _rate_limit_delay():
-    """Placeholder — rate limiting not needed for local Odoo."""
-    yield
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -222,7 +213,6 @@ STANDARD_SCENARIOS = [
 ]
 
 
-@pytest.mark.skipif(not ODOO_SERVER_AVAILABLE, reason="Odoo server not available")
 @pytest.mark.mcp
 class TestStandardAuthMatrix:
     """S1–S6: Standard mode auth scenarios against live Odoo + MCP module."""
@@ -268,12 +258,11 @@ class TestStandardAuthMatrix:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(not ODOO_SERVER_AVAILABLE, reason="Odoo server not available")
 @pytest.mark.mcp
 class TestStandardRestrictedOps:
     """Standard mode: verify MCP module denies restricted operations.
 
-    Tests the exact restricted ops from docs/auth-test-matrix.md:
+    Restricted ops covered:
     - create on res.partner → denied (create=false in MCP config)
     - unlink on res.country → denied (unlink=false in MCP config)
     - read on res.users → denied (read=false / model not enabled)
@@ -395,7 +384,6 @@ YOLO_READ_SCENARIOS = [
 ]
 
 
-@pytest.mark.skipif(not ODOO_SERVER_AVAILABLE, reason="Odoo server not available")
 @pytest.mark.yolo
 class TestYoloReadAuthMatrix:
     """Y1–Y5: YOLO read mode auth scenarios."""
@@ -517,7 +505,6 @@ YOLO_FULL_SCENARIOS = [
 ]
 
 
-@pytest.mark.skipif(not ODOO_SERVER_AVAILABLE, reason="Odoo server not available")
 @pytest.mark.yolo
 class TestYoloFullAuthMatrix:
     """F1–F5: YOLO full mode auth scenarios."""

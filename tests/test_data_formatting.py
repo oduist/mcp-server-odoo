@@ -124,8 +124,13 @@ class TestRecordFormatter:
 
         assert "Relationships:" in result
         assert "child_ids: 5 record(s)" in result
-        # Note: _get_current_record_id() returns None so the URI domain contains None
-        assert "→ View all: odoo://res.partner/search?" in result
+        # View-all hints reference the search_records tool with the related
+        # ids — resource URIs cannot carry query parameters
+        assert (
+            "→ View all: use the search_records tool with model='res.partner', "
+            'domain=[["id", "in", [1, 2, 3, 4, 5]]]' in result
+        )
+        assert "odoo://res.partner/search?" not in result
 
     def test_format_many2many_field(self, formatter):
         """Test formatting of many2many fields."""
@@ -136,7 +141,58 @@ class TestRecordFormatter:
         result = formatter.format_record(record, fields_metadata)
 
         assert "tag_ids: 3 record(s)" in result
-        assert "odoo://res.partner.category/search?domain" in result
+        assert (
+            "use the search_records tool with model='res.partner.category', "
+            'domain=[["id", "in", [10, 20, 30]]]' in result
+        )
+        assert "odoo://res.partner.category/search?" not in result
+
+    def test_format_float_precision_from_list_digits(self, formatter):
+        """XML-RPC delivers digits as a list — precision must still apply."""
+        record = {"id": 8, "name": "Test", "qty": 0.0625}
+        fields_metadata = {"qty": {"type": "float", "digits": [16, 5]}}
+
+        result = formatter.format_record(record, fields_metadata)
+
+        assert "qty: 0.06250" in result
+
+    def test_format_unset_name_falls_back_to_record_id(self, formatter):
+        """Odoo returns False for unset char fields — never print 'Name: False'."""
+        record = {"id": 9, "name": False, "display_name": False}
+
+        result = formatter.format_record(record, {})
+
+        assert "Name: Record 9" in result
+        assert "Name: False" not in result
+
+    def test_format_long_text_truncated_with_marker(self, formatter):
+        """Long text values are capped with an explicit truncation marker."""
+        long_text = "x" * 5000
+        record = {"id": 10, "name": "Test", "comment": long_text}
+        fields_metadata = {"comment": {"type": "text"}}
+
+        result = formatter.format_record(record, fields_metadata)
+
+        assert "[truncated, 5000 chars total]" in result
+        assert long_text not in result
+
+    def test_format_without_metadata_truncates_blobs(self, formatter):
+        """Metadata-less formatting must not dump huge raw values verbatim."""
+        blob = "QUJD" * 2000  # base64-ish, 8000 chars
+        record = {"id": 11, "name": "Test", "image_1920": blob}
+
+        result = formatter.format_record(record, fields_metadata=None)
+
+        assert "[truncated, 8000 chars total]" in result
+        assert blob not in result
+
+    def test_format_without_metadata_renders_many2one_shapes(self, formatter):
+        """[id, name] pairs render readably even without field metadata."""
+        record = {"id": 12, "name": "Test", "company_id": [5, "Agrolait"]}
+
+        result = formatter.format_record(record, fields_metadata=None)
+
+        assert "company_id: Agrolait (ID: 5)" in result
 
     def test_format_binary_field(self, formatter):
         """Test formatting of binary fields."""
@@ -292,16 +348,16 @@ class TestDatasetFormatter:
             total_count=30,
             current_page=2,
             total_pages=3,
-            prev_uri="odoo://res.partner/search?limit=10&offset=0",
-            next_uri="odoo://res.partner/search?limit=10&offset=20",
+            prev_hint="use the search_records tool with offset=0, limit=10",
+            next_hint="use the search_records tool with offset=20, limit=10",
         )
 
         assert "Page 2 of 3" in result
         assert "Showing records 11-20 of 30" in result
         assert "[11] Record 11" in result
         assert "[20] Record 20" in result
-        assert "← Previous page: odoo://res.partner/search?limit=10&offset=0" in result
-        assert "→ Next page: odoo://res.partner/search?limit=10&offset=20" in result
+        assert "← Previous page: use the search_records tool with offset=0, limit=10" in result
+        assert "→ Next page: use the search_records tool with offset=20, limit=10" in result
 
     def test_format_complex_domain(self, formatter):
         """Test formatting complex search domains."""
@@ -359,35 +415,36 @@ class TestFormattingIntegration:
                     pytest.skip("Rate limited by server")
                 raise
 
-            if partner_ids:
-                # Get fields metadata
-                fields_meta = connection.fields_get("res.partner")
+            assert partner_ids, "expected at least one res.partner record"
 
-                # Read the record with specific fields to avoid marshaling issues
-                records = connection.read(
-                    "res.partner",
-                    partner_ids,
-                    [
-                        "name",
-                        "email",
-                        "phone",
-                        "street",
-                        "city",
-                        "country_id",
-                        "is_company",
-                        "child_ids",
-                        "parent_id",
-                    ],
-                )
+            # Get fields metadata
+            fields_meta = connection.fields_get("res.partner")
 
-                # Format the record
-                formatter = RecordFormatter("res.partner")
-                result = formatter.format_record(records[0], fields_meta)
+            # Read the record with specific fields to avoid marshaling issues
+            records = connection.read(
+                "res.partner",
+                partner_ids,
+                [
+                    "name",
+                    "email",
+                    "phone",
+                    "street",
+                    "city",
+                    "country_id",
+                    "is_company",
+                    "child_ids",
+                    "parent_id",
+                ],
+            )
 
-                # Basic assertions
-                assert f"Record: res.partner/{partner_ids[0]}" in result
-                assert "Fields:" in result or "Relationships:" in result
-                assert "=" * 50 in result
+            # Format the record
+            formatter = RecordFormatter("res.partner")
+            result = formatter.format_record(records[0], fields_meta)
+
+            # Basic assertions
+            assert f"Record: res.partner/{partner_ids[0]}" in result
+            assert "Fields:" in result or "Relationships:" in result
+            assert "=" * 50 in result
 
         finally:
             connection.disconnect()
@@ -416,7 +473,7 @@ class TestFormattingIntegration:
             # Calculate pagination info
             current_page = 1
             total_pages = (total + 4) // 5 if total > 0 else 1
-            next_uri = "odoo://res.partner/search?limit=5&offset=5" if total > 5 else None
+            next_hint = "use the search_records tool with offset=5, limit=5" if total > 5 else None
 
             result = formatter.format_search_results(
                 records,
@@ -427,7 +484,7 @@ class TestFormattingIntegration:
                 total_count=total,
                 current_page=current_page,
                 total_pages=total_pages,
-                next_uri=next_uri,
+                next_hint=next_hint,
             )
 
             # Basic assertions
@@ -449,52 +506,51 @@ class TestFormattingIntegration:
         """Test formatting records with relationship fields."""
         config = get_config()
         connection = OdooConnection(config)
+        created_ids = []
 
         try:
             connection.connect()
             connection.authenticate()
 
-            # Find a partner with relationships
-            domain = ["|", ("child_ids", "!=", False), ("parent_id", "!=", False)]
-            partner_ids = connection.search("res.partner", domain, limit=1)
+            # Create a parent/child pair so both relationship directions are
+            # guaranteed to exist regardless of database contents. res.company
+            # is used because the test instance grants it full CRUD (res.partner
+            # is read/write only) and it has the same parent_id/child_ids pair.
+            parent_id = connection.create("res.company", {"name": "Formatting Test Parent Co"})
+            created_ids.append(parent_id)
+            child_id = connection.create(
+                "res.company", {"name": "Formatting Test Child Co", "parent_id": parent_id}
+            )
+            created_ids.append(child_id)
 
-            if partner_ids:
-                # Get fields metadata
-                fields_meta = connection.fields_get("res.partner")
+            fields_meta = connection.fields_get("res.company")
+            fields = ["name", "child_ids", "parent_id"]
+            parent_rec = connection.read("res.company", [parent_id], fields)[0]
+            child_rec = connection.read("res.company", [child_id], fields)[0]
+            assert parent_rec["child_ids"] == [child_id]
+            assert child_rec["parent_id"][0] == parent_id
 
-                # Read the record with specific fields to avoid marshaling issues
-                records = connection.read(
-                    "res.partner",
-                    partner_ids,
-                    [
-                        "name",
-                        "email",
-                        "phone",
-                        "street",
-                        "city",
-                        "country_id",
-                        "is_company",
-                        "child_ids",
-                        "parent_id",
-                    ],
-                )
+            formatter = RecordFormatter("res.company")
 
-                # Format the record
-                formatter = RecordFormatter("res.partner")
-                result = formatter.format_record(records[0], fields_meta)
+            # one2many: parent record links to its children
+            result = formatter.format_record(parent_rec, fields_meta)
+            assert "Relationships:" in result
+            assert "child_ids: 1 record(s)" in result
+            assert "use the search_records tool with model='res.company'" in result
 
-                # Check for relationships section
-                if "parent_id" in records[0] and records[0]["parent_id"]:
-                    assert "Relationships:" in result
-                    assert "parent_id:" in result
-                    assert "odoo://res.partner/record/" in result
-
-                if "child_ids" in records[0] and records[0]["child_ids"]:
-                    assert "child_ids:" in result
-                    assert "record(s)" in result
-                    assert "odoo://res.partner/search?" in result
+            # many2one: child record links back to the parent
+            result = formatter.format_record(child_rec, fields_meta)
+            assert "Relationships:" in result
+            assert "parent_id:" in result
+            assert f"(odoo://res.company/record/{parent_id})" in result
 
         finally:
+            if created_ids:
+                try:
+                    # children first — Odoo blocks deleting a company with children
+                    connection.unlink("res.company", list(reversed(created_ids)))
+                except Exception:
+                    pass
             connection.disconnect()
 
     @pytest.mark.mcp
@@ -528,65 +584,57 @@ class TestFormattingIntegration:
                         pytest.skip("Rate limited by server")
                     raise
 
-            if product_ids:
-                # Get fields metadata
-                fields_meta = connection.fields_get(model)
+            assert product_ids, f"expected at least one {model} record"
 
-                # Read the record with limited fields to avoid marshaling issues
-                # Select fields that are likely to exist in both product and partner models
-                basic_fields = ["name", "active", "create_date", "write_date"]
-                if model == "res.partner":
-                    basic_fields.extend(["email", "phone", "is_company", "country_id"])
-                else:  # product.product
-                    basic_fields.extend(["list_price", "standard_price", "type", "categ_id"])
+            # Get fields metadata
+            fields_meta = connection.fields_get(model)
 
-                records = connection.read(model, product_ids, basic_fields)
+            # Read the record with limited fields to avoid marshaling issues
+            # Select fields that are likely to exist in both product and partner models
+            basic_fields = ["name", "active", "create_date", "write_date"]
+            if model == "res.partner":
+                basic_fields.extend(["email", "phone", "is_company", "country_id"])
+            else:  # product.product
+                basic_fields.extend(["list_price", "standard_price", "type", "categ_id"])
 
-                # Format the record
-                formatter = RecordFormatter(model)
-                result = formatter.format_record(records[0], fields_meta)
+            records = connection.read(model, product_ids, basic_fields)
 
-                # Check basic structure
-                assert f"Record: {model}/{product_ids[0]}" in result
-                assert "Fields:" in result or "Relationships:" in result
+            # Format the record
+            formatter = RecordFormatter(model)
+            result = formatter.format_record(records[0], fields_meta)
 
-                # Check for different field types based on what's in the record
-                record = records[0]
+            # Check basic structure
+            assert f"Record: {model}/{product_ids[0]}" in result
+            assert "Fields:" in result or "Relationships:" in result
 
-                # Check for boolean fields
-                bool_fields = [
-                    k for k, v in fields_meta.items() if v.get("type") == "boolean" and k in record
-                ]
-                if bool_fields:
-                    field = bool_fields[0]
-                    if record[field]:
-                        assert f"{field}: Yes" in result
-                    else:
-                        assert f"{field}: No" in result
+            # Check for different field types based on what's in the record
+            record = records[0]
 
-                # Check for many2one fields
-                m2o_fields = [
-                    k
-                    for k, v in fields_meta.items()
-                    if v.get("type") == "many2one" and k in record and record[k]
-                ]
-                if m2o_fields:
-                    field = m2o_fields[0]
-                    assert f"{field}:" in result
-                    assert "odoo://" in result
+            # Boolean: 'active' exists on both models and is always returned
+            assert "active" in record
+            if record["active"]:
+                assert "active: Yes" in result
+            else:
+                assert "active: No" in result
 
-                # Check for date/datetime fields (excluding create_date which is omitted)
-                date_fields = [
-                    k
-                    for k, v in fields_meta.items()
-                    if v.get("type") in ("date", "datetime")
-                    and k in record
-                    and record[k]
-                    and k not in RecordFormatter.OMIT_FIELDS
-                ]
-                if date_fields:
-                    field = date_fields[0]
-                    assert f"{field}:" in result
+            # Many2one: categ_id is required on product.product, so the check
+            # is guaranteed to run there; on the res.partner fallback country_id
+            # may legitimately be unset
+            m2o_fields = [
+                k
+                for k, v in fields_meta.items()
+                if v.get("type") == "many2one" and k in record and record[k]
+            ]
+            if model == "product.product":
+                assert m2o_fields, "categ_id is required on product.product"
+            if m2o_fields:
+                field = m2o_fields[0]
+                assert f"{field}:" in result
+                assert "odoo://" in result
+
+            # Note: date/datetime formatting is not checked here — the only date
+            # fields requested (create_date/write_date) are in OMIT_FIELDS and
+            # never rendered; unit tests in test_datetime_formatting.py cover it
 
         finally:
             connection.disconnect()

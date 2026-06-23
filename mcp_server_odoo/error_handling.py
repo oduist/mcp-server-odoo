@@ -8,17 +8,11 @@ This module provides a centralized error handling system with:
 """
 
 import logging
-import time
 import traceback
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
-from typing import Any, Dict, List, Optional, Union
-
-from mcp.types import ErrorData
-
-from .error_sanitizer import ErrorSanitizer
+from typing import Any, Dict, Optional, Union
 
 logger = logging.getLogger(__name__)
 
@@ -55,24 +49,6 @@ class ErrorContext:
     user_id: Optional[int] = None
     request_id: Optional[str] = None
     additional_info: Dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
-class ErrorMetrics:
-    """Metrics for error tracking and monitoring."""
-
-    total_errors: int = 0
-    errors_by_category: Dict[ErrorCategory, int] = field(default_factory=dict)
-    errors_by_severity: Dict[ErrorSeverity, int] = field(default_factory=dict)
-    last_error_time: Optional[datetime] = None
-    error_rate_per_minute: float = 0.0
-
-    def record_error(self, category: ErrorCategory, severity: ErrorSeverity):
-        """Record an error occurrence."""
-        self.total_errors += 1
-        self.errors_by_category[category] = self.errors_by_category.get(category, 0) + 1
-        self.errors_by_severity[severity] = self.errors_by_severity.get(severity, 0) + 1
-        self.last_error_time = datetime.now()
 
 
 class MCPError(Exception):
@@ -120,41 +96,6 @@ class MCPError(Exception):
         }
         return codes.get(category, "UNKNOWN_ERROR")
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert error to dictionary for logging/API responses."""
-        # Sanitize message and details for external consumption
-        sanitized_message = ErrorSanitizer.sanitize_message(self.message)
-        sanitized_details = ErrorSanitizer.sanitize_error_details(self.details)
-
-        return {
-            "error": {
-                "code": self.code,
-                "message": sanitized_message,
-                "category": self.category.name,
-                "severity": self.severity.value,
-                "details": sanitized_details,
-                "context": {
-                    "model": self.context.model,
-                    "operation": self.context.operation,
-                    "record_id": self.context.record_id,
-                    "request_id": self.context.request_id,
-                },
-                "timestamp": self.timestamp.isoformat(),
-            }
-        }
-
-    def to_mcp_error(self) -> ErrorData:
-        """Convert to MCP-compliant error format."""
-        # Sanitize message and details for external consumption
-        sanitized_message = ErrorSanitizer.sanitize_message(self.message)
-        sanitized_details = ErrorSanitizer.sanitize_error_details(self.details)
-
-        return ErrorData(
-            code=-32000,  # Application error
-            message=sanitized_message,
-            data={"code": self.code, "details": sanitized_details},
-        )
-
 
 # Specific error classes for each category
 class AuthenticationError(MCPError):
@@ -169,7 +110,7 @@ class AuthenticationError(MCPError):
         )
 
 
-class PermissionError(MCPError):
+class MCPPermissionError(MCPError):
     """Permission/access denied errors."""
 
     def __init__(self, message: str, **kwargs):
@@ -205,7 +146,7 @@ class ValidationError(MCPError):
         )
 
 
-class ConnectionError(MCPError):
+class MCPConnectionError(MCPError):
     """Connection/network errors."""
 
     def __init__(self, message: str, **kwargs):
@@ -217,7 +158,7 @@ class ConnectionError(MCPError):
         )
 
 
-class SystemError(MCPError):
+class MCPSystemError(MCPError):
     """System/unexpected errors."""
 
     def __init__(self, message: str, **kwargs):
@@ -254,14 +195,7 @@ class RateLimitError(MCPError):
 
 
 class ErrorHandler:
-    """Central error handler with monitoring and logging capabilities."""
-
-    def __init__(self):
-        """Initialize error handler with metrics tracking."""
-        self.metrics = ErrorMetrics()
-        self._error_history: List[MCPError] = []
-        self._max_history_size = 1000
-        self._start_time = time.time()
+    """Central error handler: converts exceptions to MCPError and logs them."""
 
     def handle_error(
         self,
@@ -291,12 +225,6 @@ class ErrorHandler:
             # Map common exceptions to MCPError types
             mcp_error = self._convert_to_mcp_error(error, context)
 
-        # Record metrics
-        self.metrics.record_error(mcp_error.category, mcp_error.severity)
-
-        # Add to history
-        self._add_to_history(mcp_error)
-
         # Log the error
         self._log_error(mcp_error)
 
@@ -316,9 +244,9 @@ class ErrorHandler:
         # Log the full traceback internally
         logger.debug(f"Full error details: {error_type}: {error_message}\n{traceback.format_exc()}")
 
-        # Map common exceptions with sanitized messages
-        if isinstance(error, (ConnectionRefusedError, TimeoutError)):
-            return ConnectionError(
+        # Map common builtin exceptions with sanitized messages
+        if isinstance(error, (ConnectionError, TimeoutError)):
+            return MCPConnectionError(
                 f"Connection failed: {error_message}",
                 details={"category": "connection_error"},
                 context=context,
@@ -336,7 +264,10 @@ class ErrorHandler:
                 context=context,
             )
         elif isinstance(error, PermissionError):
-            return PermissionError(
+            # Builtin PermissionError (OSError subclass) — custom
+            # MCPPermissionError instances never reach this function
+            # (MCPError is returned early by handle_error)
+            return MCPPermissionError(
                 f"Access denied: {error_message}",
                 details={"category": "permission_denied"},
                 context=context,
@@ -344,17 +275,11 @@ class ErrorHandler:
         else:
             # Default to system error for unknown exceptions
             # Don't include traceback in user-facing error
-            return SystemError(
+            return MCPSystemError(
                 f"Unexpected error: {error_message}",
                 details={"category": "internal_error"},
                 context=context,
             )
-
-    def _add_to_history(self, error: MCPError):
-        """Add error to history with size limit."""
-        self._error_history.append(error)
-        if len(self._error_history) > self._max_history_size:
-            self._error_history.pop(0)
 
     def _log_error(self, error: MCPError):
         """Log error with appropriate level."""
@@ -381,131 +306,6 @@ class ErrorHandler:
             },
         )
 
-    def get_metrics(self) -> Dict[str, Any]:
-        """Get current error metrics for monitoring."""
-        uptime = time.time() - self._start_time
-        error_rate = self.metrics.total_errors / (uptime / 60) if uptime > 0 else 0
-
-        return {
-            "total_errors": self.metrics.total_errors,
-            "errors_by_category": {
-                cat.name: count for cat, count in self.metrics.errors_by_category.items()
-            },
-            "errors_by_severity": {
-                sev.value: count for sev, count in self.metrics.errors_by_severity.items()
-            },
-            "error_rate_per_minute": round(error_rate, 2),
-            "last_error_time": (
-                self.metrics.last_error_time.isoformat() if self.metrics.last_error_time else None
-            ),
-            "uptime_seconds": int(uptime),
-        }
-
-    def get_recent_errors(self, limit: int = 10) -> List[Dict[str, Any]]:
-        """Get recent errors from history."""
-        recent = self._error_history[-limit:]
-        return [error.to_dict() for error in reversed(recent)]
-
-    def clear_metrics(self):
-        """Clear error metrics (useful for testing)."""
-        self.metrics = ErrorMetrics()
-        self._error_history.clear()
-
-    @contextmanager
-    def error_context(self, **context_kwargs):
-        """Context manager for handling errors with context.
-
-        Usage:
-            with error_handler.error_context(model="res.partner", operation="search"):
-                # Code that might raise exceptions
-                pass
-        """
-        context = ErrorContext(**context_kwargs)
-        try:
-            yield context
-        except Exception as e:
-            self.handle_error(e, context=context)
-
 
 # Global error handler instance
 error_handler = ErrorHandler()
-
-
-# Utility functions for common error scenarios
-def handle_odoo_error(
-    error: Exception, model: str | None = None, operation: str | None = None
-) -> MCPError:
-    """Handle Odoo-specific errors with appropriate categorization.
-
-    Args:
-        error: The exception from Odoo
-        model: The model being accessed
-        operation: The operation being performed
-
-    Returns:
-        MCPError instance with proper categorization
-    """
-    context = ErrorContext(model=model, operation=operation)
-    error_str = str(error).lower()
-
-    # Check for specific Odoo error patterns
-    if "access denied" in error_str or "accessdenied" in error_str:
-        return PermissionError(
-            f"Access denied for {operation} on {model}: {error}",
-            context=context,
-        )
-    elif "does not exist" in error_str or "not found" in error_str:
-        return NotFoundError(
-            f"Resource not found: {model if model else 'Unknown'}: {error}",
-            context=context,
-        )
-    elif "invalid" in error_str or "validation" in error_str:
-        return ValidationError(
-            f"Validation failed for {operation}: {error}",
-            context=context,
-        )
-    elif "connection" in error_str or "timeout" in error_str:
-        return ConnectionError(
-            f"Connection to Odoo failed: {error}",
-            context=context,
-        )
-    else:
-        return SystemError(
-            f"Odoo error during {operation}: {error}",
-            context=context,
-        )
-
-
-def format_user_error(error: MCPError) -> str:
-    """Format error for user-friendly display.
-
-    Args:
-        error: The MCPError to format
-
-    Returns:
-        User-friendly error message
-    """
-    # Base message
-    message = error.message
-
-    # Add context if available
-    if error.context.model:
-        message = f"{message} (Model: {error.context.model})"
-
-    # Add helpful suggestions based on error type
-    suggestions = {
-        ErrorCategory.AUTHENTICATION: "Please check your credentials and try again.",
-        ErrorCategory.PERMISSION: "You don't have permission for this operation. Contact your administrator.",
-        ErrorCategory.NOT_FOUND: "The requested resource doesn't exist or has been deleted.",
-        ErrorCategory.VALIDATION: "Please check your input and try again.",
-        ErrorCategory.CONNECTION: "Unable to connect to Odoo. Please check your connection settings.",
-        ErrorCategory.SYSTEM: "An unexpected error occurred. Please try again later.",
-        ErrorCategory.CONFIGURATION: "Server configuration error. Please contact your administrator.",
-        ErrorCategory.RATE_LIMIT: "Too many requests. Please wait a moment and try again.",
-    }
-
-    suggestion = suggestions.get(error.category)
-    if suggestion:
-        message = f"{message}\n\n{suggestion}"
-
-    return message

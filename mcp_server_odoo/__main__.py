@@ -56,6 +56,11 @@ Optional environment variables:
   ODOO_MCP_PORT            Server port for HTTP transports (default: 8000)
   ODOO_MCP_AUTH_TOKEN      Bearer token for HTTP client authentication
   ODOO_MCP_SERVER_URL      Public URL of this MCP server (required for OAuth)
+  ODOO_MCP_ENABLE_METHOD_CALLS  Enable call_model_method tool, requires ODOO_YOLO=true (default: false)
+  ODOO_MCP_ALLOWED_HOSTS   Comma-separated list of allowed Host headers for
+                           DNS rebinding protection (e.g., odoo.example.com,localhost)
+  ODOO_MCP_SESSION_IDLE_TIMEOUT  Seconds of inactivity before an HTTP session
+                           is closed and its resources freed (default: never)
 
 For more information, visit: https://github.com/ivnvxd/mcp-server-odoo""",
     )
@@ -66,36 +71,41 @@ For more information, visit: https://github.com/ivnvxd/mcp-server-odoo""",
         version=f"odoo-mcp-server v{SERVER_VERSION}",
     )
 
+    # CLI flags default to None sentinels: load_config() resolves the
+    # actual values from the environment AND the .env file. Eagerly
+    # baking env values into argparse defaults (and writing them back to
+    # os.environ below) would mask .env settings, because load_dotenv()
+    # never overrides variables already present in the environment.
     parser.add_argument(
         "--transport",
         choices=["stdio", "streamable-http"],
-        default=os.getenv("ODOO_MCP_TRANSPORT", "stdio"),
-        help="Transport type to use (default: stdio)",
+        default=None,
+        help="Transport type to use (default: stdio; env: ODOO_MCP_TRANSPORT)",
     )
 
     parser.add_argument(
         "--host",
-        default=os.getenv("ODOO_MCP_HOST", "localhost"),
-        help="Server host for HTTP transports (default: localhost)",
+        default=None,
+        help="Server host for HTTP transports (default: localhost; env: ODOO_MCP_HOST)",
     )
 
     parser.add_argument(
         "--port",
         type=int,
-        default=int(os.getenv("ODOO_MCP_PORT", "8000")),
-        help="Server port for HTTP transports (default: 8000)",
+        default=None,
+        help="Server port for HTTP transports (default: 8000; env: ODOO_MCP_PORT)",
     )
 
     # Parse arguments
     args = parser.parse_args(argv)
 
     try:
-        # Override environment variables with CLI arguments
-        if args.transport:
+        # Override environment variables with explicitly-passed CLI arguments
+        if args.transport is not None:
             os.environ["ODOO_MCP_TRANSPORT"] = args.transport
-        if args.host:
+        if args.host is not None:
             os.environ["ODOO_MCP_HOST"] = args.host
-        if args.port:
+        if args.port is not None:
             os.environ["ODOO_MCP_PORT"] = str(args.port)
 
         # Load configuration from environment

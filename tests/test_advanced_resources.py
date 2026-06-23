@@ -7,11 +7,8 @@ from urllib.parse import quote
 import pytest
 from mcp.server.fastmcp import FastMCP
 
-from mcp_server_odoo.access_control import AccessControlError, AccessController
+from mcp_server_odoo.access_control import AccessController
 from mcp_server_odoo.config import OdooConfig, load_config
-from mcp_server_odoo.error_handling import (
-    PermissionError as MCPPermissionError,
-)
 from mcp_server_odoo.error_handling import (
     ValidationError,
 )
@@ -87,119 +84,6 @@ def mock_app():
 def resource_handler(mock_app, mock_connection, mock_access_controller, mock_config):
     """Create a resource handler instance."""
     return OdooResourceHandler(mock_app, mock_connection, mock_access_controller, mock_config)
-
-
-class TestBrowseResource:
-    """Test browse resource functionality."""
-
-    @pytest.mark.asyncio
-    async def test_browse_multiple_records(
-        self, resource_handler, mock_connection, mock_access_controller
-    ):
-        """Test browsing multiple records by IDs with safe-field filtering."""
-        # Setup mocks
-        mock_access_controller.validate_model_access.return_value = None
-        mock_connection.read.return_value = [
-            {"id": 1, "name": "Record 1", "email": "r1@example.com"},
-            {"id": 3, "name": "Record 3", "email": "r3@example.com"},
-            {"id": 5, "name": "Record 5", "email": "r5@example.com"},
-        ]
-
-        # Execute browse
-        result = await resource_handler._handle_browse("res.partner", "1,3,5")
-
-        # Verify access control
-        mock_access_controller.validate_model_access.assert_called_once_with("res.partner", "read")
-
-        # Verify safe-field filtering was applied: read should be called with safe fields
-        read_call_args = mock_connection.read.call_args
-        assert read_call_args[0][0] == "res.partner"
-        assert read_call_args[0][1] == [1, 3, 5]
-        safe_fields = read_call_args[0][2]
-        # Binary/html/private fields must be excluded
-        assert "image_1920" not in safe_fields
-        assert "website_description" not in safe_fields
-        assert "__last_update" not in safe_fields
-        # Normal fields must be included
-        assert "name" in safe_fields
-        assert "email" in safe_fields
-
-        # Check result format
-        assert "Browse Results: res.partner" in result
-        assert "Requested IDs: 1, 3, 5" in result
-        assert "Found: 3 of 3 records" in result
-        assert "Record 1" in result
-        assert "Record 3" in result
-        assert "Record 5" in result
-
-    @pytest.mark.asyncio
-    async def test_browse_with_missing_records(
-        self, resource_handler, mock_connection, mock_access_controller
-    ):
-        """Test browsing with some missing records."""
-        # Setup mocks
-        mock_access_controller.validate_model_access.return_value = None
-        mock_connection.read.return_value = [
-            {"id": 1, "name": "Record 1"},
-            {"id": 3, "name": "Record 3"},
-        ]
-
-        # Execute browse (fields_get returns realistic data from fixture)
-        result = await resource_handler._handle_browse("res.partner", "1,2,3,4")
-
-        # Check result shows missing records
-        assert "Requested IDs: 1, 2, 3, 4" in result
-        assert "Found: 2 of 4 records" in result
-        assert "Missing IDs: 2, 4" in result
-
-    @pytest.mark.asyncio
-    async def test_browse_invalid_ids(
-        self, resource_handler, mock_connection, mock_access_controller
-    ):
-        """Test browse with invalid ID formats."""
-        # Setup mocks
-        mock_access_controller.validate_model_access.return_value = None
-        mock_connection.read.return_value = [
-            {"id": 1, "name": "Record 1"},
-        ]
-
-        # Execute browse with mixed valid/invalid IDs
-        result = await resource_handler._handle_browse("res.partner", "1,abc,2.5,-3,0")
-
-        # Should only use valid ID (1); verify safe-field filtering applied
-        read_call_args = mock_connection.read.call_args
-        assert read_call_args[0][0] == "res.partner"
-        assert read_call_args[0][1] == [1]
-        safe_fields = read_call_args[0][2]
-        assert "image_1920" not in safe_fields  # binary excluded
-        assert "name" in safe_fields  # normal field included
-        assert "Record 1" in result
-
-    @pytest.mark.asyncio
-    async def test_browse_empty_ids(self, resource_handler, mock_access_controller):
-        """Test browse with empty ID list."""
-        # Setup mocks
-        mock_access_controller.validate_model_access.return_value = None
-
-        # Execute browse and expect error
-        with pytest.raises(ValidationError) as exc_info:
-            await resource_handler._handle_browse("res.partner", "")
-
-        assert "No valid IDs provided" in str(exc_info.value)
-
-    @pytest.mark.asyncio
-    async def test_browse_access_denied(self, resource_handler, mock_access_controller):
-        """Test browse with access denied."""
-        # Setup access denial
-        mock_access_controller.validate_model_access.side_effect = AccessControlError(
-            "Model 'sale.order' is not enabled for MCP access"
-        )
-
-        # Execute browse and expect permission error
-        with pytest.raises(MCPPermissionError) as exc_info:
-            await resource_handler._handle_browse("sale.order", "1,2,3")
-
-        assert "Access denied" in str(exc_info.value)
 
 
 class TestCountResource:
@@ -466,20 +350,6 @@ class TestFieldsEdgeCases:
         assert "Server unreachable" in str(exc_info.value)
 
 
-class TestBrowseNotAuthenticated:
-    """Test browse resource when not authenticated."""
-
-    @pytest.mark.asyncio
-    async def test_browse_not_authenticated(self, resource_handler, mock_connection):
-        """Test that _handle_browse raises ValidationError when not authenticated."""
-        mock_connection.is_authenticated = False
-
-        with pytest.raises(ValidationError) as exc_info:
-            await resource_handler._handle_browse("res.partner", "1,2,3")
-
-        assert "Not authenticated with Odoo" in str(exc_info.value)
-
-
 class TestCountNotAuthenticated:
     """Test count resource when not authenticated."""
 
@@ -510,46 +380,6 @@ class TestFieldsNotAuthenticated:
 
 class TestAdvancedResourceIntegration:
     """Integration tests for advanced resources with real Odoo."""
-
-    @pytest.mark.asyncio
-    @pytest.mark.mcp
-    @skip_on_rate_limit
-    async def test_browse_real_records(self, real_config, real_connection):
-        """Test browse with real Odoo connection."""
-        # Setup real components
-        app = Mock(spec=FastMCP)
-        app.resource = Mock()
-        app._handlers = {}
-
-        def resource_decorator(uri_pattern, **kwargs):
-            def decorator(func):
-                app._handlers[uri_pattern] = func
-                return func
-
-            return decorator
-
-        app.resource.side_effect = resource_decorator
-
-        access_controller = AccessController(real_config)
-        handler = OdooResourceHandler(app, real_connection, access_controller, real_config)
-
-        # Authenticate
-        real_connection.connect()
-        real_connection.authenticate()
-
-        # Get some partner IDs to browse
-        partner_ids = real_connection.search("res.partner", [], limit=3)
-
-        if partner_ids:
-            # Execute real browse
-            ids_str = ",".join(map(str, partner_ids))
-            result = await handler._handle_browse("res.partner", ids_str)
-
-            # Verify result
-            assert "Browse Results: res.partner" in result
-            assert f"Found: {len(partner_ids)} of {len(partner_ids)} records" in result
-            for pid in partner_ids:
-                assert str(pid) in result
 
     @pytest.mark.asyncio
     @pytest.mark.mcp

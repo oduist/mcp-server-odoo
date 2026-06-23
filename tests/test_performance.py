@@ -1,6 +1,5 @@
 """Tests for performance optimization module."""
 
-import asyncio
 import os
 import time
 from datetime import datetime, timedelta
@@ -15,7 +14,6 @@ from mcp_server_odoo.performance import (
     ConnectionPool,
     PerformanceManager,
     PerformanceMonitor,
-    RequestOptimizer,
 )
 
 
@@ -119,6 +117,44 @@ class TestCache:
         stats = cache.get_stats()
         assert stats["expired_evictions"] == 1
 
+    def test_cache_memory_budget_enforced(self):
+        """Total cached bytes never exceed max_memory_mb (loops evictions)."""
+        cache = Cache(max_size=100, max_memory_mb=1)
+        budget = 1024 * 1024
+
+        # Many small entries, then large ones — one-shot eviction would
+        # let the total drift far past the budget
+        for i in range(60):
+            cache.put(f"small{i}", "x" * 100)
+        for i in range(10):
+            cache.put(f"large{i}", "y" * 200_000)
+
+        stats = cache.get_stats()
+        assert stats["total_size_mb"] <= budget / (1024 * 1024)
+
+    def test_cache_rejects_value_larger_than_budget(self):
+        """A single value above the whole budget is not cached."""
+        cache = Cache(max_size=10, max_memory_mb=1)
+
+        cache.put("huge", "z" * (2 * 1024 * 1024))
+
+        assert cache.get("huge") is None
+        assert cache.get_stats()["total_entries"] == 0
+
+    def test_cache_update_existing_key_evicts_nothing_else(self):
+        """Replacing a key in a full cache must not evict an unrelated entry."""
+        cache = Cache(max_size=3)
+        cache.put("a", "1")
+        cache.put("b", "2")
+        cache.put("c", "3")
+
+        cache.put("a", "1-updated")
+
+        assert cache.get("a") == "1-updated"
+        assert cache.get("b") == "2"
+        assert cache.get("c") == "3"
+        assert cache.get_stats()["total_entries"] == 3
+
     def test_cache_lru_eviction(self):
         """Test LRU eviction when cache is full."""
         cache = Cache(max_size=3)
@@ -205,17 +241,9 @@ class TestConnectionPool:
         config.url = os.getenv("ODOO_URL", "http://localhost:8069")
         return config
 
-    def test_connection_pool_creation(self, mock_config):
-        """Test creating a connection pool."""
-        pool = ConnectionPool(mock_config, max_connections=5)
-
-        assert pool.max_connections == 5
-        assert pool.config == mock_config
-        assert len(pool._connections) == 0
-
     @patch("mcp_server_odoo.performance.ServerProxy")
     def test_get_connection(self, mock_proxy, mock_config):
-        """Test getting a connection from pool."""
+        """Test getting connections from the factory."""
         pool = ConnectionPool(mock_config)
 
         # Get a connection
@@ -225,52 +253,50 @@ class TestConnectionPool:
         mock_proxy.assert_called_once()
         stats = pool.get_stats()
         assert stats["connections_created"] == 1
-        assert stats["connections_reused"] == 0
 
-        # Get same endpoint again (should reuse)
+        # Get same endpoint again (always creates a new proxy)
         pool.get_connection("/xmlrpc/2/common")
 
+        assert mock_proxy.call_count == 2
         stats = pool.get_stats()
-        assert stats["connections_created"] == 1
-        assert stats["connections_reused"] == 1
+        assert stats["connections_created"] == 2
+
+    def test_odoo_transport_sets_connection_timeout_http(self):
+        """OdooTransport applies the configured timeout to its HTTP connections."""
+        from mcp_server_odoo.performance import OdooTransport
+
+        transport = OdooTransport(database="mydb", timeout=15)
+        conn = transport.make_connection("localhost:8069")
+        assert conn.timeout == 15
+
+    def test_odoo_transport_sets_connection_timeout_https(self):
+        """OdooSafeTransport applies the configured timeout to its HTTPS connections."""
+        from mcp_server_odoo.performance import OdooSafeTransport
+
+        transport = OdooSafeTransport(timeout=7)
+        conn = transport.make_connection("example.com")
+        assert conn.timeout == 7
+
+    def test_odoo_transport_no_timeout_keeps_default(self):
+        """Without an explicit timeout, the connection default is untouched."""
+        import socket as socket_mod
+
+        from mcp_server_odoo.performance import OdooTransport
+
+        transport = OdooTransport()
+        conn = transport.make_connection("localhost:8069")
+        assert conn.timeout is socket_mod._GLOBAL_DEFAULT_TIMEOUT
 
     @patch("mcp_server_odoo.performance.ServerProxy")
-    def test_connection_pool_max_limit(self, mock_proxy, mock_config):
-        """Test connection pool respects max connections."""
-        pool = ConnectionPool(mock_config, max_connections=2)
+    def test_pool_passes_timeout_to_transports(self, mock_proxy, mock_config):
+        """ConnectionPool propagates its timeout to every transport it creates."""
+        mock_config.url = "http://localhost:8069"
+        pool = ConnectionPool(mock_config, timeout=12)
 
-        # Create max connections
-        pool.get_connection("/endpoint1")
-        pool.get_connection("/endpoint2")
-
-        stats = pool.get_stats()
-        assert stats["active_connections"] == 2
-
-        # Creating another should remove oldest
-        pool.get_connection("/endpoint3")
-
-        stats = pool.get_stats()
-        assert stats["active_connections"] == 2
-        assert stats["connections_closed"] == 1
-
-    @patch("mcp_server_odoo.performance.ServerProxy")
-    def test_connection_pool_set_database(self, mock_proxy, mock_config):
-        """Test set_database clears pool and sets transport database."""
-        pool = ConnectionPool(mock_config, max_connections=5)
-
-        # Create a couple of connections first
         pool.get_connection("/xmlrpc/2/common")
-        pool.get_connection("/xmlrpc/2/object")
-        assert pool.get_stats()["active_connections"] == 2
 
-        # Set database
-        pool.set_database("new_db")
-
-        # Pool should be cleared
-        assert pool.get_stats()["active_connections"] == 0
-        assert pool.get_stats()["connections_closed"] == 2
-        # Transport should have database set
-        assert pool._transport.database == "new_db"
+        transport = mock_proxy.call_args.kwargs["transport"]
+        assert transport.timeout == 12
 
     def test_odoo_transport_sends_database_header(self, mock_config):
         """Test OdooTransport injects X-Odoo-Database header via send_headers."""
@@ -285,121 +311,60 @@ class TestConnectionPool:
         # Verify that putheader was called with the database header
         mock_connection.putheader.assert_called_with("X-Odoo-Database", "mydb")
 
-    def test_connection_pool_clear(self, mock_config):
-        """Test clearing connection pool."""
+    @patch("mcp_server_odoo.performance.ServerProxy")
+    def test_each_proxy_gets_distinct_transport_http(self, mock_proxy, mock_config):
+        """Each ServerProxy must get its own transport instance."""
+        from mcp_server_odoo.performance import OdooTransport
+
+        mock_config.url = "http://localhost:8069"
         pool = ConnectionPool(mock_config)
 
-        # Add some connections
-        with patch("mcp_server_odoo.performance.ServerProxy"):
-            pool.get_connection("/endpoint1")
-            pool.get_connection("/endpoint2")
+        pool.get_connection("/xmlrpc/2/common")
+        pool.get_connection("/xmlrpc/2/object")
 
-        # Clear pool
-        pool.clear()
+        # Two distinct endpoints → two ServerProxy calls with distinct transports
+        assert mock_proxy.call_count == 2
+        t1 = mock_proxy.call_args_list[0].kwargs["transport"]
+        t2 = mock_proxy.call_args_list[1].kwargs["transport"]
+        assert t1 is not t2
+        assert isinstance(t1, OdooTransport)
+        assert isinstance(t2, OdooTransport)
 
-        stats = pool.get_stats()
-        assert stats["active_connections"] == 0
-        assert stats["connections_closed"] == 2
+        # Same endpoint again → a new proxy with its own transport
+        pool.get_connection("/xmlrpc/2/common")
+        assert mock_proxy.call_count == 3
+        t3 = mock_proxy.call_args_list[2].kwargs["transport"]
+        assert t3 is not t1
 
+    @patch("mcp_server_odoo.performance.ServerProxy")
+    def test_each_proxy_gets_distinct_transport_https(self, mock_proxy, mock_config):
+        """HTTPS scheme must produce distinct OdooSafeTransport per proxy."""
+        from mcp_server_odoo.performance import OdooSafeTransport
 
-class TestRequestOptimizer:
-    """Test RequestOptimizer functionality."""
+        mock_config.url = "https://example.com"
+        pool = ConnectionPool(mock_config)
 
-    def test_field_usage_tracking(self):
-        """Test tracking field usage."""
-        optimizer = RequestOptimizer()
+        pool.get_connection("/xmlrpc/2/common")
+        pool.get_connection("/xmlrpc/2/object")
 
-        # Track field usage
-        optimizer.track_field_usage("res.partner", ["name", "email"])
-        optimizer.track_field_usage("res.partner", ["name", "phone"])
-        optimizer.track_field_usage("res.partner", ["name", "is_company"])
+        assert mock_proxy.call_count == 2
+        t1 = mock_proxy.call_args_list[0].kwargs["transport"]
+        t2 = mock_proxy.call_args_list[1].kwargs["transport"]
+        assert t1 is not t2
+        assert isinstance(t1, OdooSafeTransport)
+        assert isinstance(t2, OdooSafeTransport)
 
-        # Get optimized fields
-        fields = optimizer.get_optimized_fields("res.partner", None)
+    @patch("mcp_server_odoo.performance.ServerProxy")
+    def test_per_proxy_transport_inherits_database(self, mock_proxy, mock_config):
+        """After set_database, new proxies get transports with the new database."""
+        mock_config.url = "http://localhost:8069"
+        pool = ConnectionPool(mock_config)
 
-        # "name" should be first (used 3 times)
-        assert fields[0] == "name"
-        assert len(fields) <= 20
+        pool.set_database("mydb")
+        pool.get_connection("/xmlrpc/2/object")
 
-    def test_get_optimized_fields_passthrough(self):
-        """Test that explicitly requested fields are returned as-is (early-return path)."""
-        optimizer = RequestOptimizer()
-
-        # When specific fields are requested, they should pass through unchanged
-        fields = optimizer.get_optimized_fields("res.partner", ["id", "display_name"])
-        assert fields == ["id", "display_name"]
-
-    def test_get_optimized_fields_default_when_no_usage(self):
-        """Test that default fields are returned when no usage data exists."""
-        optimizer = RequestOptimizer()
-
-        # No usage data → should return common default fields
-        fields = optimizer.get_optimized_fields("res.partner", None)
-        assert fields == ["id", "display_name"]
-
-    def test_get_optimized_fields_uses_usage_data(self):
-        """Test that field optimization returns most-used fields based on tracking."""
-        optimizer = RequestOptimizer()
-
-        # Simulate usage data — record_field_usage tracks which fields are accessed
-        optimizer._field_usage["res.partner"] = {
-            "name": 50,
-            "email": 40,
-            "phone": 30,
-            "city": 20,
-            "zip": 10,
-            "rarely_used": 1,
-        }
-
-        fields = optimizer.get_optimized_fields("res.partner", None)
-
-        # Should return fields sorted by usage (most used first), up to 20
-        assert fields[0] == "name"  # Most used
-        assert fields[1] == "email"  # Second most used
-        assert len(fields) == 6  # All 6 fields (less than 20 limit)
-        assert "rarely_used" in fields  # Even rare fields included when under limit
-
-    def test_get_optimized_fields_limits_to_top_20(self):
-        """Test that optimization caps at 20 fields even with more usage data."""
-        optimizer = RequestOptimizer()
-
-        # Create 25 fields with usage data
-        optimizer._field_usage["res.partner"] = {f"field_{i}": 100 - i for i in range(25)}
-
-        fields = optimizer.get_optimized_fields("res.partner", None)
-        assert len(fields) == 20
-        # Top field should be first
-        assert fields[0] == "field_0"
-        # field_20 through field_24 should be excluded
-        assert "field_20" not in fields
-
-    def test_should_batch_request(self):
-        """Test batch request logic."""
-        optimizer = RequestOptimizer()
-
-        # Large read should be batched
-        assert optimizer.should_batch_request("res.partner", "read", 100) is True
-
-        # Small read should not
-        assert optimizer.should_batch_request("res.partner", "read", 10) is False
-
-    def test_batch_queue(self):
-        """Test batch queue operations."""
-        optimizer = RequestOptimizer()
-
-        # Add to batch
-        optimizer.add_to_batch("res.partner", "read", {"ids": [1, 2, 3]})
-        optimizer.add_to_batch("res.partner", "read", {"ids": [4, 5, 6]})
-
-        # Get batch
-        batch = optimizer.get_batch("res.partner", "read")
-        assert len(batch) == 2
-        assert batch[0]["ids"] == [1, 2, 3]
-        assert batch[1]["ids"] == [4, 5, 6]
-
-        # Queue should be empty now
-        batch = optimizer.get_batch("res.partner", "read")
-        assert len(batch) == 0
+        transport = mock_proxy.call_args_list[0].kwargs["transport"]
+        assert transport.database == "mydb"
 
 
 class TestPerformanceMonitor:
@@ -433,11 +398,11 @@ class TestPerformanceMonitor:
         stats = monitor.get_stats()
         assert stats["operations"]["op1"]["count"] == 5
         assert stats["operations"]["op2"]["count"] == 3
-        # Both ops have recorded positive durations
+        # Both ops have recorded positive durations. (No cross-operation
+        # avg comparison: sleep() oversleep on loaded CI runners made the
+        # ordering assertion flaky.)
         assert stats["operations"]["op1"]["avg_ms"] > 0
         assert stats["operations"]["op2"]["avg_ms"] > 0
-        # op2 sleeps 5x longer, so its average should be higher
-        assert stats["operations"]["op2"]["avg_ms"] > stats["operations"]["op1"]["avg_ms"]
 
 
 class TestPerformanceManager:
@@ -456,10 +421,7 @@ class TestPerformanceManager:
 
         assert manager.config == mock_config
         assert manager.field_cache is not None
-        assert manager.record_cache is not None
-        assert manager.permission_cache is not None
         assert manager.connection_pool is not None
-        assert manager.request_optimizer is not None
         assert manager.monitor is not None
 
     def test_cache_key_generation(self, mock_config):
@@ -497,61 +459,12 @@ class TestPerformanceManager:
         cached = manager.get_cached_fields("res.partner")
         assert cached == fields
 
-    def test_record_caching(self, mock_config):
-        """Test record caching."""
-        manager = PerformanceManager(mock_config)
-
-        record = {"id": 1, "name": "Test Partner", "email": "test@example.com"}
-
-        # Cache record
-        manager.cache_record("res.partner", record, fields=["name", "email"])
-
-        # Get cached record
-        cached = manager.get_cached_record("res.partner", 1, fields=["name", "email"])
-        assert cached == record
-
-    def test_record_cache_invalidation(self, mock_config):
-        """Test record cache invalidation."""
-        manager = PerformanceManager(mock_config)
-
-        # Cache some records with same fields parameter as when retrieving
-        manager.cache_record("res.partner", {"id": 1, "name": "Partner 1"}, fields=None)
-        manager.cache_record("res.partner", {"id": 2, "name": "Partner 2"}, fields=None)
-        manager.cache_record("res.users", {"id": 1, "name": "User 1"}, fields=None)
-
-        # Verify they're cached
-        assert manager.get_cached_record("res.partner", 1, fields=None) is not None
-        assert manager.get_cached_record("res.partner", 2, fields=None) is not None
-
-        # Invalidate specific record
-        manager.invalidate_record_cache("res.partner", 1)
-        assert manager.get_cached_record("res.partner", 1, fields=None) is None
-        assert manager.get_cached_record("res.partner", 2, fields=None) is not None
-
-        # Invalidate all partner records
-        manager.invalidate_record_cache("res.partner")
-        assert manager.get_cached_record("res.partner", 2, fields=None) is None
-        assert manager.get_cached_record("res.users", 1, fields=None) is not None
-
-    def test_permission_caching(self, mock_config):
-        """Test permission caching."""
-        manager = PerformanceManager(mock_config)
-
-        # Cache permission
-        manager.cache_permission("res.partner", "read", user_id=2, allowed=True)
-
-        # Get cached permission
-        cached = manager.get_cached_permission("res.partner", "read", user_id=2)
-        assert cached is True
-
     def test_get_comprehensive_stats(self, mock_config):
         """Test getting comprehensive performance stats."""
         manager = PerformanceManager(mock_config)
 
         # Do some operations
         manager.cache_fields("res.partner", {"name": {"type": "char"}})
-        manager.cache_record("res.partner", {"id": 1, "name": "Test"})
-        manager.cache_permission("res.partner", "read", 2, True)
 
         with manager.monitor.track_operation("test_op"):
             time.sleep(0.001)
@@ -561,8 +474,6 @@ class TestPerformanceManager:
 
         assert "caches" in stats
         assert "field_cache" in stats["caches"]
-        assert "record_cache" in stats["caches"]
-        assert "permission_cache" in stats["caches"]
         assert "connection_pool" in stats
         assert "performance" in stats
 
@@ -572,100 +483,318 @@ class TestPerformanceManager:
 
         # Add data to caches
         manager.cache_fields("res.partner", {"name": {"type": "char"}})
-        manager.cache_record("res.partner", {"id": 1, "name": "Test"})
-        manager.cache_permission("res.partner", "read", 2, True)
 
         # Clear all
         manager.clear_all_caches()
 
         # Verify all caches are empty
         assert manager.get_cached_fields("res.partner") is None
-        assert manager.get_cached_record("res.partner", 1) is None
-        assert manager.get_cached_permission("res.partner", "read", 2) is None
-
-    def test_optimize_search_fields(self, mock_config):
-        """Test optimize_search_fields returns optimized fields and tracks usage."""
-        manager = PerformanceManager(mock_config)
-
-        # Pre-populate field usage so optimizer has data
-        manager.request_optimizer.track_field_usage("res.partner", ["name", "email"])
-        manager.request_optimizer.track_field_usage("res.partner", ["name", "phone"])
-
-        # Call optimize_search_fields with no explicit fields
-        result = manager.optimize_search_fields("res.partner")
-
-        # Should return fields ranked by usage: name (2), email (1), phone (1)
-        assert "name" in result
-        assert "email" in result
-        assert "phone" in result
-
-        # Verify side effect: usage counts increased from the internal track call
-        usage = manager.request_optimizer._field_usage["res.partner"]
-        # name was tracked 2 + 1 (from optimize call) = 3
-        assert usage["name"] == 3
-        # email was tracked 1 + 1 = 2
-        assert usage["email"] == 2
 
 
-class TestPerformanceIntegration:
-    """Integration tests for performance features."""
+class TestSharedSSLContext:
+    """HTTPS transports from one factory share a single ssl.SSLContext."""
 
     @pytest.fixture
     def mock_config(self):
-        """Create mock config."""
         config = Mock(spec=OdooConfig)
-        config.url = os.getenv("ODOO_URL", "http://localhost:8069")
+        config.url = "https://example.com"
         return config
 
-    @pytest.mark.asyncio
-    async def test_concurrent_cache_access(self, mock_config):
-        """Test cache with concurrent access."""
-        manager = PerformanceManager(mock_config)
+    @patch("mcp_server_odoo.performance.ServerProxy")
+    def test_safe_transports_share_one_context(self, mock_proxy, mock_config):
+        """Avoids per-transport context construction and lets TLS session
+        tickets ride between the per-proxy keepalive sockets."""
+        pool = ConnectionPool(mock_config)
 
-        async def cache_operation(i):
-            """Perform cache operations."""
-            # Write
-            manager.cache_record("res.partner", {"id": i, "name": f"Partner {i}"}, fields=None)
+        pool.get_connection("/xmlrpc/2/common")
+        pool.get_connection("/xmlrpc/2/object")
+        pool.get_connection("/xmlrpc/db")
 
-            # Read
-            for _ in range(10):
-                record = manager.get_cached_record("res.partner", i, fields=None)
-                assert record is not None
-                await asyncio.sleep(0.001)
+        transports = [call.kwargs["transport"] for call in mock_proxy.call_args_list]
+        assert len(transports) == 3
+        assert pool._ssl_context is not None
+        for transport in transports:
+            assert transport.context is pool._ssl_context
 
-        # Run concurrent operations (start from 1 to avoid ID 0)
-        tasks = [cache_operation(i) for i in range(1, 11)]
-        await asyncio.gather(*tasks)
+    def test_http_pool_has_no_ssl_context(self, mock_config):
+        """HTTP factories must not allocate an SSL context."""
+        mock_config.url = "http://localhost:8069"
+        pool = ConnectionPool(mock_config)
+        assert pool._ssl_context is None
 
-        # Check stats
-        stats = manager.record_cache.get_stats()
-        assert stats["hits"] >= 90  # At least 90 hits from 10 tasks * 10 reads
-        assert stats["total_entries"] == 10
 
-    def test_performance_under_load(self, mock_config):
-        """Test performance manager under load."""
-        manager = PerformanceManager(mock_config)
+class TestDeadKeepaliveRecovery:
+    """Half-open keepalive handling at the transport layer (issue #68).
 
-        start_time = time.time()
+    Pure unit-level coverage — tiny in-process TCP servers, no live Odoo.
+    """
 
-        # Simulate heavy usage
-        for i in range(1000):
-            # Cache operations
-            manager.cache_record("res.partner", {"id": i, "name": f"Partner {i}"})
+    @staticmethod
+    def _silent_server():
+        """TCP server that accepts, drains the request, and never responds."""
+        import socket as socket_mod
+        import threading
 
-            # Some cache hits
-            if i > 100:
-                manager.get_cached_record("res.partner", i - 100)
+        server = socket_mod.socket(socket_mod.AF_INET, socket_mod.SOCK_STREAM)
+        server.setsockopt(socket_mod.SOL_SOCKET, socket_mod.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(4)
+        port = server.getsockname()[1]
+        stop = threading.Event()
+        connections = []
 
-            # Track operations
-            with manager.monitor.track_operation(f"op_{i % 10}"):
-                time.sleep(0.0001)
+        def accept_loop():
+            server.settimeout(0.5)
+            while not stop.is_set():
+                try:
+                    sock, _ = server.accept()
+                except socket_mod.timeout:
+                    continue
+                except OSError:
+                    return
+                connections.append(sock)
+                try:
+                    sock.settimeout(0.5)
+                    sock.recv(4096)
+                except (socket_mod.timeout, OSError):
+                    pass
 
-        duration = time.time() - start_time
+        thread = threading.Thread(target=accept_loop, daemon=True)
+        thread.start()
+        return server, port, stop, connections, thread
 
-        # Should complete reasonably fast
-        assert duration < 10.0  # 10 seconds for 1000 operations (generous for CI)
+    def test_fresh_connection_timeout_not_retried(self):
+        """A timeout on a freshly-opened connection (no cached keepalive
+        socket) must raise after ONE attempt — retrying a genuinely slow
+        server would double the wait and could double-submit writes."""
+        from mcp_server_odoo.performance import OdooTransport
 
-        # Check cache is working
-        stats = manager.record_cache.get_stats()
-        assert stats["hit_rate"] > 0.8  # Good hit rate
+        server, port, stop, connections, thread = self._silent_server()
+        try:
+            transport = OdooTransport(timeout=1.0)
+            t0 = time.monotonic()
+            with pytest.raises((TimeoutError, OSError)):
+                transport.request(
+                    f"127.0.0.1:{port}",
+                    "/xmlrpc/2/common",
+                    b"<?xml version='1.0'?><methodCall><methodName>x</methodName></methodCall>",
+                )
+            elapsed = time.monotonic() - t0
+
+            assert elapsed < 2.5, f"took {elapsed:.2f}s — looks like a doubled (retried) wait"
+            assert len(connections) == 1, "fresh-connection timeout must not open a retry socket"
+        finally:
+            stop.set()
+            for sock in connections:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+            server.close()
+            thread.join(timeout=2.0)
+
+    def test_half_open_keepalive_triggers_transparent_retry(self):
+        """The actual issue #68 mechanism: request 1 succeeds and the server
+        keeps the connection alive; the server then goes silent (half-open);
+        request 2 times out on the REUSED socket and must be retried once on
+        a fresh connection, succeeding transparently."""
+        import socket as socket_mod
+        import threading
+
+        from mcp_server_odoo.performance import OdooTransport
+
+        body = (
+            b'<?xml version="1.0"?>\n<methodResponse>\n<params>\n<param>\n'
+            b"<value><int>1</int></value>\n</param>\n</params>\n</methodResponse>\n"
+        )
+        keepalive_response = (
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode()
+            + b"Connection: keep-alive\r\n\r\n"
+            + body
+        )
+
+        server = socket_mod.socket(socket_mod.AF_INET, socket_mod.SOCK_STREAM)
+        server.setsockopt(socket_mod.SOL_SOCKET, socket_mod.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(4)
+        port = server.getsockname()[1]
+        stop = threading.Event()
+        connections_seen = [0]
+
+        def drain_one_request(sock):
+            buf = b""
+            sock.settimeout(2.0)
+            while b"\r\n\r\n" not in buf:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    return False
+                buf += chunk
+            # Drain the body (Content-Length from headers)
+            headers = buf.split(b"\r\n\r\n", 1)[0].lower()
+            for line in headers.split(b"\r\n"):
+                if line.startswith(b"content-length:"):
+                    length = int(line.split(b":", 1)[1])
+                    have = len(buf.split(b"\r\n\r\n", 1)[1])
+                    while have < length:
+                        chunk = sock.recv(4096)
+                        if not chunk:
+                            return False
+                        have += len(chunk)
+            return True
+
+        def handle_first(sock):
+            # First connection: answer request 1 with keep-alive, then GO
+            # SILENT — drain request 2 but never respond (half-open from
+            # the client's perspective).
+            try:
+                if drain_one_request(sock):
+                    sock.sendall(keepalive_response)
+                drain_one_request(sock)  # request 2 — swallow it
+                stop.wait(10)
+            except OSError:
+                pass
+
+        def handle_retry(sock):
+            # Retry connection: respond normally.
+            try:
+                if drain_one_request(sock):
+                    sock.sendall(keepalive_response)
+            except OSError:
+                pass
+            finally:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+        def accept_loop():
+            server.settimeout(0.5)
+            while not stop.is_set():
+                try:
+                    sock, _ = server.accept()
+                except socket_mod.timeout:
+                    continue
+                except OSError:
+                    return
+                connections_seen[0] += 1
+                # Each connection gets its own thread: connection 1 blocks
+                # in stop.wait() while the retry's connection 2 must be
+                # accepted and served concurrently.
+                handler = handle_first if connections_seen[0] == 1 else handle_retry
+                threading.Thread(target=handler, args=(sock,), daemon=True).start()
+
+        thread = threading.Thread(target=accept_loop, daemon=True)
+        thread.start()
+
+        request_body = b"<?xml version='1.0'?><methodCall><methodName>x</methodName></methodCall>"
+        try:
+            transport = OdooTransport(timeout=1.5)
+            host = f"127.0.0.1:{port}"
+
+            # Request 1: primes the keepalive socket
+            assert transport.request(host, "/x", request_body) == (1,)
+            cached = transport._connection[1]
+            assert cached is not None and cached.sock is not None, (
+                "expected a live cached keepalive socket after request 1"
+            )
+
+            # Request 2: half-open — must transparently retry and succeed
+            t0 = time.monotonic()
+            result = transport.request(host, "/x", request_body)
+            elapsed = time.monotonic() - t0
+
+            assert result == (1,)
+            assert connections_seen[0] == 2, "retry must open a fresh connection"
+            # Bounded: ~timeout (dead read) + fast retry
+            assert 1.0 <= elapsed < 4.0, f"took {elapsed:.2f}s, expected ~1.5s + retry"
+        finally:
+            stop.set()
+            server.close()
+            thread.join(timeout=2.0)
+
+    def test_write_timeout_on_reused_keepalive_not_retried(self):
+        """A timed-out call marked non-retry-safe (create/write/unlink/...)
+        must NOT be re-sent over a reused keepalive socket — the server may
+        still be processing the first attempt, and re-sending would
+        double-execute the write."""
+        import socket as socket_mod
+        import threading
+
+        from mcp_server_odoo.performance import OdooTransport
+
+        body = (
+            b'<?xml version="1.0"?>\n<methodResponse>\n<params>\n<param>\n'
+            b"<value><int>1</int></value>\n</param>\n</params>\n</methodResponse>\n"
+        )
+        keepalive_response = (
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/xml\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode()
+            + b"Connection: keep-alive\r\n\r\n"
+            + body
+        )
+
+        server = socket_mod.socket(socket_mod.AF_INET, socket_mod.SOCK_STREAM)
+        server.setsockopt(socket_mod.SOL_SOCKET, socket_mod.SO_REUSEADDR, 1)
+        server.bind(("127.0.0.1", 0))
+        server.listen(4)
+        port = server.getsockname()[1]
+        stop = threading.Event()
+        connections_seen = [0]
+
+        def handle_connection(sock):
+            # Answer request 1 with keep-alive, then GO SILENT — request 2
+            # times out on the reused socket and must NOT be retried.
+            try:
+                sock.settimeout(2.0)
+                buf = b""
+                while b"</methodCall>" not in buf:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        return
+                    buf += chunk
+                sock.sendall(keepalive_response)
+                stop.wait(10)
+            except OSError:
+                pass
+
+        def accept_loop():
+            server.settimeout(0.5)
+            while not stop.is_set():
+                try:
+                    sock, _ = server.accept()
+                except socket_mod.timeout:
+                    continue
+                except OSError:
+                    return
+                connections_seen[0] += 1
+                threading.Thread(target=handle_connection, args=(sock,), daemon=True).start()
+
+        thread = threading.Thread(target=accept_loop, daemon=True)
+        thread.start()
+
+        request_body = b"<?xml version='1.0'?><methodCall><methodName>x</methodName></methodCall>"
+        try:
+            transport = OdooTransport(timeout=1.5)
+            host = f"127.0.0.1:{port}"
+
+            # Request 1: primes the keepalive socket
+            assert transport.request(host, "/x", request_body) == (1,)
+            cached = transport._connection[1]
+            assert cached is not None and cached.sock is not None, (
+                "expected a live cached keepalive socket after request 1"
+            )
+
+            # Request 2: marked as a write — must raise, never re-send
+            transport.timeout_retry_safe = False
+            t0 = time.monotonic()
+            with pytest.raises(TimeoutError):
+                transport.request(host, "/x", request_body)
+            elapsed = time.monotonic() - t0
+
+            assert connections_seen[0] == 1, "a timed-out write must not open a retry connection"
+            assert elapsed < 3.0, f"took {elapsed:.2f}s — looks like a doubled (retried) wait"
+        finally:
+            stop.set()
+            server.close()
+            thread.join(timeout=2.0)
