@@ -1,4 +1,4 @@
-"""In-memory OAuth 2.0 authorization server for MCP HTTP transport.
+"""OAuth 2.0 authorization server for MCP HTTP transport.
 
 Implements the ``OAuthAuthorizationServerProvider`` protocol expected by
 the MCP Python SDK so that OAuth-only clients (e.g. Claude.ai) can
@@ -6,14 +6,19 @@ connect to the server.
 
 The authorization "gate" is the static ``ODOO_MCP_AUTH_TOKEN`` — the user
 must enter it on a minimal consent page to prove they are allowed to use
-this server.  Everything else (clients, codes, tokens) lives in memory
-for the lifetime of the process.
+this server.  Authorization codes and pending-consent state always live in
+memory (they are short-lived, in-flight-only data), but registered clients
+and access/refresh tokens are persisted to ``store_path`` when configured,
+so client logins survive a process or container restart.  Without a store
+path everything lives in memory for the lifetime of the process.
 """
 
-import hashlib
+import json
 import logging
+import os
 import secrets
 import time
+from pathlib import Path
 from typing import Optional
 from urllib.parse import urlencode
 
@@ -21,12 +26,11 @@ from mcp.server.auth.provider import (
     AccessToken,
     AuthorizationCode,
     AuthorizationParams,
-    OAuthAuthorizationServerProvider,
     RefreshToken,
-    TokenError,
     construct_redirect_uri,
 )
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+from pydantic import ValidationError
 
 logger = logging.getLogger(__name__)
 
@@ -37,11 +41,18 @@ REFRESH_TOKEN_TTL = 86400 * 30  # 30 days
 
 
 class OdooOAuthProvider:
-    """Minimal in-memory OAuth provider gated by a static secret token."""
+    """Minimal OAuth provider gated by a static secret token.
 
-    def __init__(self, server_url: str, auth_token: str):
+    Clients and tokens are kept in memory and, when *store_path* is set,
+    mirrored to a JSON file so they survive a restart.
+    """
+
+    def __init__(self, server_url: str, auth_token: str, store_path: Optional[str] = None):
         self.server_url = server_url.rstrip("/")
         self.auth_token = auth_token
+
+        # Optional on-disk mirror of clients + tokens (None = memory only).
+        self._store_path: Optional[Path] = Path(store_path).expanduser() if store_path else None
 
         # In-memory stores keyed by their respective identifiers
         self._clients: dict[str, OAuthClientInformationFull] = {}
@@ -53,6 +64,110 @@ class OdooOAuthProvider:
         # look them up after the user submits the form.
         self._pending_auth: dict[str, AuthorizationParams] = {}
 
+        if self._store_path:
+            self._load()
+
+    # ── Persistence ──────────────────────────────────────────────────
+
+    def _load(self) -> None:
+        """Restore persisted clients and tokens from disk (best-effort).
+
+        Auth codes and pending-consent state are intentionally not
+        persisted: they are short-lived and only valid mid-handshake.
+        A missing, unreadable, or malformed file simply starts empty —
+        it must never crash startup.
+        """
+        path = self._store_path
+        if not path or not path.exists():
+            return
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            logger.warning("OAuth: could not read state file %s: %s", path, exc)
+            return
+
+        now = int(time.time())
+
+        def _live(raw: dict) -> bool:
+            exp = raw.get("expires_at")
+            return exp is None or exp > now
+
+        try:
+            for cid, raw in (data.get("clients") or {}).items():
+                self._clients[cid] = OAuthClientInformationFull.model_validate(raw)
+            for tok, raw in (data.get("access_tokens") or {}).items():
+                if _live(raw):
+                    self._access_tokens[tok] = AccessToken.model_validate(raw)
+            for tok, raw in (data.get("refresh_tokens") or {}).items():
+                if _live(raw):
+                    self._refresh_tokens[tok] = RefreshToken.model_validate(raw)
+        except (ValidationError, AttributeError) as exc:
+            logger.warning("OAuth: ignoring malformed state in %s: %s", path, exc)
+            self._clients.clear()
+            self._access_tokens.clear()
+            self._refresh_tokens.clear()
+            return
+
+        logger.info(
+            "OAuth: restored %d client(s) and %d access + %d refresh token(s) from %s",
+            len(self._clients),
+            len(self._access_tokens),
+            len(self._refresh_tokens),
+            path,
+        )
+
+    def _save(self) -> None:
+        """Persist clients and tokens to disk atomically (best-effort).
+
+        Called after every mutation. Only currently-live tokens are
+        written, so expired entries are pruned on the next save. The file
+        holds bearer/refresh tokens, so it is created ``0600`` in a
+        ``0700`` directory. A disk error is logged, never raised — it must
+        not break a live OAuth request.
+        """
+        path = self._store_path
+        if not path:
+            return
+
+        now = int(time.time())
+        payload = {
+            "version": 1,
+            "clients": {
+                cid: client.model_dump(mode="json") for cid, client in self._clients.items()
+            },
+            "access_tokens": {
+                tok: at.model_dump(mode="json")
+                for tok, at in self._access_tokens.items()
+                if at.expires_at is None or at.expires_at > now
+            },
+            "refresh_tokens": {
+                tok: rt.model_dump(mode="json")
+                for tok, rt in self._refresh_tokens.items()
+                if rt.expires_at is None or rt.expires_at > now
+            },
+        }
+
+        tmp = path.with_name(f"{path.name}.tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(path.parent, 0o700)
+            except OSError:
+                pass  # best-effort; e.g. unsupported on the platform
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except OSError as exc:
+            logger.warning("OAuth: could not persist state to %s: %s", path, exc)
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+
     # ── Client registration ─────────────────────────────────────────
 
     async def get_client(self, client_id: str) -> Optional[OAuthClientInformationFull]:
@@ -60,6 +175,7 @@ class OdooOAuthProvider:
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
         self._clients[client_info.client_id] = client_info
+        self._save()
         logger.info(f"OAuth: registered client {client_info.client_id}")
 
     # ── Authorization ────────────────────────────────────────────────
@@ -87,9 +203,7 @@ class OdooOAuthProvider:
 
     # ── Consent completion (called by our custom route handler) ──────
 
-    def complete_authorization(
-        self, request_id: str, client_id: str
-    ) -> str:
+    def complete_authorization(self, request_id: str, client_id: str) -> str:
         """Validate the pending request and return a redirect URL with the
         authorization code appended.
 
@@ -157,6 +271,7 @@ class OdooOAuthProvider:
             scopes=authorization_code.scopes,
             expires_at=now + REFRESH_TOKEN_TTL,
         )
+        self._save()
 
         logger.info(f"OAuth: issued access token for client {client.client_id}")
 
@@ -203,6 +318,7 @@ class OdooOAuthProvider:
             scopes=effective_scopes,
             expires_at=now + REFRESH_TOKEN_TTL,
         )
+        self._save()
 
         logger.info(f"OAuth: refreshed token for client {client.client_id}")
 
@@ -230,4 +346,5 @@ class OdooOAuthProvider:
             self._access_tokens.pop(token.token, None)
         elif isinstance(token, RefreshToken):
             self._refresh_tokens.pop(token.token, None)
+        self._save()
         logger.info("OAuth: revoked token")

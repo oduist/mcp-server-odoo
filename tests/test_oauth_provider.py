@@ -3,7 +3,6 @@
 import time
 
 import pytest
-
 from mcp.shared.auth import OAuthClientInformationFull
 
 from mcp_server_odoo.oauth_provider import (
@@ -209,3 +208,117 @@ async def test_revoke_access_token():
 
     await p.revoke_token(at)
     assert await p.load_access_token("t1") is None
+
+
+# ── Persistence ─────────────────────────────────────────────────────
+
+
+async def _mint_tokens(p):
+    """Run the full authorize→consent→exchange flow, returning (client, token)."""
+    from urllib.parse import parse_qs, urlparse
+
+    from mcp.server.auth.provider import AuthorizationParams
+
+    client = _make_client()
+    await p.register_client(client)
+    params = AuthorizationParams(
+        state="s",
+        scopes=["odoo"],
+        code_challenge="c",
+        redirect_uri="https://app.example.com/callback",
+        redirect_uri_provided_explicitly=True,
+    )
+    url = await p.authorize(client, params)
+    rid = parse_qs(urlparse(url).query)["request_id"][0]
+    rurl = p.complete_authorization(rid, client.client_id)
+    code = parse_qs(urlparse(rurl).query)["code"][0]
+    auth_code = await p.load_authorization_code(client, code)
+    return client, await p.exchange_authorization_code(client, auth_code)
+
+
+@pytest.mark.asyncio
+async def test_state_persisted_and_reloaded(tmp_path):
+    store = tmp_path / "oauth_state.json"
+    p = OdooOAuthProvider(server_url=SERVER_URL, auth_token=AUTH_TOKEN, store_path=str(store))
+    client, token = await _mint_tokens(p)
+    assert store.exists()
+
+    # A fresh provider over the same path restores client + tokens —
+    # i.e. the client does NOT have to log in again after a restart.
+    p2 = OdooOAuthProvider(server_url=SERVER_URL, auth_token=AUTH_TOKEN, store_path=str(store))
+    assert await p2.get_client(client.client_id) is not None
+    assert await p2.load_access_token(token.access_token) is not None
+    rt = await p2.load_refresh_token(client, token.refresh_token)
+    assert rt is not None
+    # The restored refresh token still works.
+    new_token = await p2.exchange_refresh_token(client, rt, ["odoo"])
+    assert new_token.access_token
+
+
+@pytest.mark.asyncio
+async def test_state_file_has_restrictive_permissions(tmp_path):
+    import stat
+
+    store = tmp_path / "nested" / "oauth_state.json"
+    p = OdooOAuthProvider(server_url=SERVER_URL, auth_token=AUTH_TOKEN, store_path=str(store))
+    await _mint_tokens(p)
+
+    assert store.exists()  # parent dir was created
+    assert stat.S_IMODE(store.stat().st_mode) == 0o600
+
+
+@pytest.mark.asyncio
+async def test_expired_tokens_pruned_on_load(tmp_path):
+    import json
+
+    past = int(time.time()) - 10
+    store = tmp_path / "oauth_state.json"
+    store.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "clients": {},
+                "access_tokens": {
+                    "old": {"token": "old", "client_id": "c", "scopes": [], "expires_at": past}
+                },
+                "refresh_tokens": {
+                    "old-r": {"token": "old-r", "client_id": "c", "scopes": [], "expires_at": past}
+                },
+            }
+        )
+    )
+
+    p = OdooOAuthProvider(server_url=SERVER_URL, auth_token=AUTH_TOKEN, store_path=str(store))
+    assert await p.load_access_token("old") is None
+    assert "old-r" not in p._refresh_tokens
+
+
+@pytest.mark.asyncio
+async def test_corrupt_state_file_starts_empty(tmp_path):
+    store = tmp_path / "oauth_state.json"
+    store.write_text("{ not valid json ]")
+
+    # Must not raise — a broken file just starts fresh.
+    p = OdooOAuthProvider(server_url=SERVER_URL, auth_token=AUTH_TOKEN, store_path=str(store))
+    assert await p.get_client("anything") is None
+
+
+@pytest.mark.asyncio
+async def test_malformed_client_entry_ignored(tmp_path):
+    import json
+
+    store = tmp_path / "oauth_state.json"
+    store.write_text(json.dumps({"version": 1, "clients": {"bad": {"not": "a client"}}}))
+
+    p = OdooOAuthProvider(server_url=SERVER_URL, auth_token=AUTH_TOKEN, store_path=str(store))
+    assert await p.get_client("bad") is None
+
+
+@pytest.mark.asyncio
+async def test_no_store_path_is_memory_only(tmp_path):
+    p = OdooOAuthProvider(server_url=SERVER_URL, auth_token=AUTH_TOKEN)
+    assert p._store_path is None
+
+    _, token = await _mint_tokens(p)  # works fine without persistence
+    assert await p.load_access_token(token.access_token) is not None
+    assert list(tmp_path.iterdir()) == []  # provider wrote no files

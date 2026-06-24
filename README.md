@@ -261,6 +261,40 @@ docker run --rm -p 8000:8000 \
 
 > ⚠️ **Security**: the HTTP transport has no built-in authentication — anyone who can reach the port gets Odoo access through the server's credentials. Publish the port only on trusted networks, or front it with an authenticating reverse proxy. See [Transport Options](#transport-options).
 
+**Persisting OAuth logins across restarts.** When OAuth is enabled (`ODOO_MCP_AUTH_TOKEN` + `ODOO_MCP_SERVER_URL`), the server stores client registrations and access/refresh tokens in memory by default, so **every client must log in again after a restart**. The image persists them to `/data/oauth_state.json` (`ODOO_MCP_OAUTH_STORE_PATH`); mount a **named** volume there to keep them:
+
+```bash
+docker volume create mcp-oauth
+docker run --rm -p 8000:8000 \
+  -e ODOO_URL=http://host.docker.internal:8069 \
+  -e ODOO_API_KEY=your-api-key-here \
+  -e ODOO_MCP_AUTH_TOKEN=your-shared-secret \
+  -e ODOO_MCP_SERVER_URL=https://mcp.example.com \
+  -v mcp-oauth:/data \
+  ivnvxd/mcp-server-odoo --transport streamable-http --host 0.0.0.0
+```
+
+Or with Compose:
+
+```yaml
+services:
+  mcp:
+    image: ivnvxd/mcp-server-odoo
+    command: ["--transport", "streamable-http", "--host", "0.0.0.0"]
+    ports: ["8000:8000"]
+    environment:
+      ODOO_URL: http://host.docker.internal:8069
+      ODOO_API_KEY: your-api-key-here
+      ODOO_MCP_AUTH_TOKEN: your-shared-secret
+      ODOO_MCP_SERVER_URL: https://mcp.example.com
+    volumes:
+      - mcp-oauth:/data
+volumes:
+  mcp-oauth:
+```
+
+> A **named** volume (or bind mount) is required: with `docker run --rm` an anonymous volume is discarded when the container is recreated. The state file holds bearer/refresh tokens and is written with `0600` permissions — keep the volume private. Runs without a single shared instance (multiple replicas) are out of scope; each replica keeps its own file.
+
 The image is also available on GHCR: `ghcr.io/ivnvxd/mcp-server-odoo`
 </details>
 

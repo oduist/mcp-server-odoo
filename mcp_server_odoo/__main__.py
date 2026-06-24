@@ -56,6 +56,8 @@ Optional environment variables:
   ODOO_MCP_PORT            Server port for HTTP transports (default: 8000)
   ODOO_MCP_AUTH_TOKEN      Bearer token for HTTP client authentication
   ODOO_MCP_SERVER_URL      Public URL of this MCP server (required for OAuth)
+  ODOO_MCP_OAUTH_STORE_PATH  JSON file to persist OAuth clients/tokens across
+                           restarts (back it with a volume; default: in-memory)
   ODOO_MCP_ENABLE_METHOD_CALLS  Enable call_model_method tool, requires ODOO_YOLO=true (default: false)
   ODOO_MCP_ALLOWED_HOSTS   Comma-separated list of allowed Host headers for
                            DNS rebinding protection (e.g., odoo.example.com,localhost)

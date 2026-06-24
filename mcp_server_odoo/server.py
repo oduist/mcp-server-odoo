@@ -99,6 +99,7 @@ class OdooMCPServer:
             self._oauth_provider = OdooOAuthProvider(
                 server_url=self.config.server_url,
                 auth_token=self.config.auth_token,
+                store_path=self.config.oauth_store_path,
             )
             fastmcp_kwargs.update(
                 auth_server_provider=self._oauth_provider,

@@ -42,6 +42,11 @@ class OdooConfig:
     auth_token: Optional[str] = None  # Bearer token for HTTP transport auth
     server_url: Optional[str] = None  # Public URL of this MCP server (for OAuth metadata)
 
+    # Path to a JSON file persisting OAuth client registrations and tokens.
+    # None = in-memory only (lost on restart). Set via ODOO_MCP_OAUTH_STORE_PATH
+    # and back it with a volume so client logins survive restarts.
+    oauth_store_path: Optional[str] = None
+
     # Idle seconds before a streamable-http session is evicted (None = never).
     # Without it, abandoned sessions pin their transport state (streams,
     # task, server instance) in the session manager until process restart.
@@ -294,6 +299,7 @@ def load_config(env_file: Optional[Path] = None) -> OdooConfig:
         port=get_int_env("ODOO_MCP_PORT", 8000),
         auth_token=os.getenv("ODOO_MCP_AUTH_TOKEN", "").strip() or None,
         server_url=os.getenv("ODOO_MCP_SERVER_URL", "").strip() or None,
+        oauth_store_path=os.getenv("ODOO_MCP_OAUTH_STORE_PATH", "").strip() or None,
         session_idle_timeout=get_optional_float_env("ODOO_MCP_SESSION_IDLE_TIMEOUT"),
         locale=os.getenv("ODOO_LOCALE", "").strip() or None,
         yolo_mode=get_yolo_mode(),
