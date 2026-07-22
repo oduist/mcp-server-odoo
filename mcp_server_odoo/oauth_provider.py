@@ -89,19 +89,17 @@ class OdooOAuthProvider:
 
         now = int(time.time())
 
-        def _live(raw: dict) -> bool:
-            exp = raw.get("expires_at")
-            return exp is None or exp > now
-
         try:
             for cid, raw in (data.get("clients") or {}).items():
                 self._clients[cid] = OAuthClientInformationFull.model_validate(raw)
             for tok, raw in (data.get("access_tokens") or {}).items():
-                if _live(raw):
-                    self._access_tokens[tok] = AccessToken.model_validate(raw)
+                access_token = AccessToken.model_validate(raw)
+                if access_token.expires_at is None or access_token.expires_at > now:
+                    self._access_tokens[tok] = access_token
             for tok, raw in (data.get("refresh_tokens") or {}).items():
-                if _live(raw):
-                    self._refresh_tokens[tok] = RefreshToken.model_validate(raw)
+                refresh_token = RefreshToken.model_validate(raw)
+                if refresh_token.expires_at is None or refresh_token.expires_at > now:
+                    self._refresh_tokens[tok] = refresh_token
         except (ValidationError, AttributeError) as exc:
             logger.warning("OAuth: ignoring malformed state in %s: %s", path, exc)
             self._clients.clear()
@@ -150,11 +148,9 @@ class OdooOAuthProvider:
 
         tmp = path.with_name(f"{path.name}.tmp")
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                os.chmod(path.parent, 0o700)
-            except OSError:
-                pass  # best-effort; e.g. unsupported on the platform
+            # The mode only applies when the leaf directory is newly created;
+            # existing directories may be shared and must keep their permissions.
+            path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh)

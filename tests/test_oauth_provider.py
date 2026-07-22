@@ -265,6 +265,20 @@ async def test_state_file_has_restrictive_permissions(tmp_path):
 
     assert store.exists()  # parent dir was created
     assert stat.S_IMODE(store.stat().st_mode) == 0o600
+    assert stat.S_IMODE(store.parent.stat().st_mode) == 0o700
+
+
+@pytest.mark.asyncio
+async def test_existing_store_directory_permissions_are_preserved(tmp_path):
+    import stat
+
+    store_dir = tmp_path / "shared"
+    store_dir.mkdir(mode=0o755)
+    store = store_dir / "oauth_state.json"
+    p = OdooOAuthProvider(server_url=SERVER_URL, auth_token=AUTH_TOKEN, store_path=str(store))
+    await _mint_tokens(p)
+
+    assert stat.S_IMODE(store_dir.stat().st_mode) == 0o755
 
 
 @pytest.mark.asyncio
@@ -301,6 +315,31 @@ async def test_corrupt_state_file_starts_empty(tmp_path):
     # Must not raise — a broken file just starts fresh.
     p = OdooOAuthProvider(server_url=SERVER_URL, auth_token=AUTH_TOKEN, store_path=str(store))
     assert await p.get_client("anything") is None
+
+
+@pytest.mark.asyncio
+async def test_invalid_token_expiration_starts_empty(tmp_path):
+    import json
+
+    store = tmp_path / "oauth_state.json"
+    store.write_text(
+        json.dumps(
+            {
+                "clients": {},
+                "access_tokens": {
+                    "bad": {
+                        "token": "bad",
+                        "client_id": "c",
+                        "scopes": [],
+                        "expires_at": "never",
+                    }
+                },
+            }
+        )
+    )
+
+    p = OdooOAuthProvider(server_url=SERVER_URL, auth_token=AUTH_TOKEN, store_path=str(store))
+    assert await p.load_access_token("bad") is None
 
 
 @pytest.mark.asyncio

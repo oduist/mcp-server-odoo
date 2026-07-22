@@ -48,7 +48,7 @@ services:
   mcp-server-odoo:
     build: .
     # Or use the published image instead of building from this repo:
-    # image: ivnvxd/mcp-server-odoo:latest
+    # image: oduist/odoo-mcp-server:latest
     command: ["--transport", "streamable-http", "--host", "0.0.0.0"]
     restart: unless-stopped
     # No published ports: Traefik reaches it over the internal compose network.

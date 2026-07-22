@@ -271,7 +271,7 @@ docker run --rm -p 8000:8000 \
   -e ODOO_MCP_AUTH_TOKEN=your-shared-secret \
   -e ODOO_MCP_SERVER_URL=https://mcp.example.com \
   -v mcp-oauth:/data \
-  ivnvxd/mcp-server-odoo --transport streamable-http --host 0.0.0.0
+  oduist/odoo-mcp-server --transport streamable-http --host 0.0.0.0
 ```
 
 Or with Compose:
@@ -279,7 +279,7 @@ Or with Compose:
 ```yaml
 services:
   mcp:
-    image: ivnvxd/mcp-server-odoo
+    image: oduist/odoo-mcp-server
     command: ["--transport", "streamable-http", "--host", "0.0.0.0"]
     ports: ["8000:8000"]
     environment:
