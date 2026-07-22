@@ -1,0 +1,98 @@
+# Docker Compose for the Odoo MCP Server behind Traefik (streamable-http).
+#
+# Traefik terminates TLS (Let's Encrypt) and routes ${MCP_DOMAIN} to the MCP
+# server, giving OAuth the public HTTPS URL it requires (ODOO_MCP_SERVER_URL).
+# OAuth client registrations and access/refresh tokens are persisted to the
+# named `mcp-oauth` volume, so MCP clients stay logged in across restarts.
+#
+# Required in a sibling .env file (Compose substitutes ${VAR} from it):
+#   MCP_DOMAIN=mcp.example.com        # public hostname, DNS A/AAAA -> this host
+#   ACME_EMAIL=you@example.com        # Let's Encrypt registration/expiry email
+#   ODOO_URL=http://host.docker.internal:8069
+#   ODOO_API_KEY=your-api-key
+#   ODOO_MCP_AUTH_TOKEN=your-shared-secret   # set to enable OAuth/bearer auth
+#
+# Prerequisites: ports 80 and 443 reachable from the internet and MCP_DOMAIN
+# resolving to this host (needed for the Let's Encrypt HTTP challenge).
+#
+# Usage:
+#   cp .env.example .env   # then add the variables listed above
+#   docker compose up -d --build
+
+services:
+  traefik:
+    image: traefik:v3.3
+    restart: unless-stopped
+    command:
+      # Discover containers via Docker labels; only expose opted-in ones.
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      # Entry points: HTTP (challenge + redirect) and HTTPS.
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      # Let's Encrypt via HTTP-01 challenge.
+      - "--certificatesresolvers.le.acme.httpchallenge=true"
+      - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=web"
+      - "--certificatesresolvers.le.acme.email=${ACME_EMAIL:?set ACME_EMAIL in your .env}"
+      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      # Read-only Docker socket so Traefik can watch container labels.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - traefik-letsencrypt:/letsencrypt
+
+  mcp-server-odoo:
+    build: .
+    # Or use the published image instead of building from this repo:
+    # image: ivnvxd/mcp-server-odoo:latest
+    command: ["--transport", "streamable-http", "--host", "0.0.0.0"]
+    restart: unless-stopped
+    # No published ports: Traefik reaches it over the internal compose network.
+    expose:
+      - "8000"
+    environment:
+      # --- Odoo connection (required) ---
+      ODOO_URL: ${ODOO_URL:?set ODOO_URL in your .env}
+      ODOO_API_KEY: ${ODOO_API_KEY:-}
+      ODOO_DB: ${ODOO_DB:-}
+      # --- HTTP client authentication ---
+      # Setting BOTH ODOO_MCP_AUTH_TOKEN and ODOO_MCP_SERVER_URL enables the
+      # OAuth flow (required for OAuth-only clients such as Claude.ai). The
+      # public URL is derived from the Traefik hostname below.
+      ODOO_MCP_AUTH_TOKEN: ${ODOO_MCP_AUTH_TOKEN:-}
+      ODOO_MCP_SERVER_URL: https://${MCP_DOMAIN:?set MCP_DOMAIN in your .env}
+      # Traefik forwards the external Host header, so restrict it for the
+      # SDK's DNS-rebinding protection.
+      ODOO_MCP_ALLOWED_HOSTS: ${MCP_DOMAIN}
+      # OAuth state file — kept on the mcp-oauth volume so logins survive
+      # restarts. Matches the image default; shown here for clarity.
+      ODOO_MCP_OAUTH_STORE_PATH: /data/oauth_state.json
+    volumes:
+      # NAMED volume (not anonymous): survives `docker compose down` and
+      # container recreation. Remove it with `docker compose down -v`.
+      - mcp-oauth:/data
+    # Makes `host.docker.internal` resolve to the host on Linux too, for
+    # ODOO_URL=http://host.docker.internal:8069 (no-op on Docker Desktop).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.mcp.rule=Host(`${MCP_DOMAIN}`)"
+      - "traefik.http.routers.mcp.entrypoints=websecure"
+      - "traefik.http.routers.mcp.tls.certresolver=le"
+      - "traefik.http.services.mcp.loadbalancer.server.port=8000"
+    healthcheck:
+      # /health bypasses authentication, so this works with OAuth enabled.
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  mcp-oauth:
+  traefik-letsencrypt:

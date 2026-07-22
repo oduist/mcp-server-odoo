@@ -174,9 +174,13 @@ class OdooOAuthProvider:
         return self._clients.get(client_id)
 
     async def register_client(self, client_info: OAuthClientInformationFull) -> None:
-        self._clients[client_info.client_id] = client_info
+        client_id = client_info.client_id
+        if client_id is None:
+            raise ValueError("OAuth client registration requires client_id")
+
+        self._clients[client_id] = client_info
         self._save()
-        logger.info(f"OAuth: registered client {client_info.client_id}")
+        logger.info(f"OAuth: registered client {client_id}")
 
     # ── Authorization ────────────────────────────────────────────────
 
