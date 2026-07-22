@@ -16,6 +16,12 @@ COPY --from=builder --chown=mcp:mcp /usr/local/bin/mcp-server-odoo /usr/local/bi
 
 ENV PYTHONUNBUFFERED=1
 
+# Persist OAuth client registrations and tokens here so client logins survive
+# container restarts. Mount a NAMED volume at /data (e.g. -v mcp-oauth:/data) —
+# an anonymous volume is discarded when the container is recreated (--rm).
+RUN mkdir /data && chown mcp:mcp /data
+ENV ODOO_MCP_OAUTH_STORE_PATH=/data/oauth_state.json
+
 EXPOSE 8000
 
 LABEL org.opencontainers.image.title="mcp-server-odoo"
