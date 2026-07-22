@@ -145,6 +145,48 @@ async def test_load_access_token():
 
 
 @pytest.mark.asyncio
+async def test_static_auth_token_accepted_as_bearer():
+    """The configured static token works as a direct Bearer token,
+    alongside OAuth-issued tokens, without any handshake."""
+    from mcp_server_odoo.oauth_provider import STATIC_TOKEN_CLIENT_ID
+
+    p = _make_provider()
+    at = await p.load_access_token(AUTH_TOKEN)
+    assert at is not None
+    assert at.client_id == STATIC_TOKEN_CLIENT_ID
+    assert at.scopes == ["odoo"]
+    # Never expires — it is not a minted, TTL-bound token.
+    assert at.expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_static_token_and_oauth_token_coexist():
+    """A static-token request and an OAuth-issued token both authenticate
+    against the same provider simultaneously."""
+    p = _make_provider()
+    _, token = await _mint_tokens(p)
+
+    # OAuth-issued token still verifies.
+    assert await p.load_access_token(token.access_token) is not None
+    # Static token verifies too, on the same provider.
+    assert await p.load_access_token(AUTH_TOKEN) is not None
+
+
+@pytest.mark.asyncio
+async def test_wrong_static_token_rejected():
+    p = _make_provider()
+    assert await p.load_access_token("not-the-token") is None
+
+
+@pytest.mark.asyncio
+async def test_non_ascii_bearer_token_rejected_without_error():
+    """A non-ASCII bearer token (attacker-controlled, latin-1 decoded by the
+    transport) must cleanly mismatch, not raise from compare_digest."""
+    p = _make_provider()
+    assert await p.load_access_token("tökén-\xff") is None
+
+
+@pytest.mark.asyncio
 async def test_expired_access_token_returns_none():
     p = _make_provider()
     from mcp_server_odoo.oauth_provider import AccessToken

@@ -11,8 +11,15 @@ memory (they are short-lived, in-flight-only data), but registered clients
 and access/refresh tokens are persisted to ``store_path`` when configured,
 so client logins survive a process or container restart.  Without a store
 path everything lives in memory for the lifetime of the process.
+
+In addition to OAuth-issued access tokens, a client may present the static
+``ODOO_MCP_AUTH_TOKEN`` **directly** as an ``Authorization: Bearer`` token,
+bypassing the OAuth handshake entirely.  Both mechanisms are accepted on the
+same endpoint simultaneously — OAuth clients (e.g. Claude.ai) and simple
+clients that just send a fixed token can coexist.  See ``load_access_token``.
 """
 
+import hmac
 import json
 import logging
 import os
@@ -38,6 +45,10 @@ logger = logging.getLogger(__name__)
 AUTH_CODE_TTL = 300  # 5 minutes
 ACCESS_TOKEN_TTL = 3600  # 1 hour
 REFRESH_TOKEN_TTL = 86400 * 30  # 30 days
+
+# Synthetic client id reported for the static-token bearer path, so audit
+# logs can tell a direct static-token request apart from an OAuth client.
+STATIC_TOKEN_CLIENT_ID = "static-token"
 
 
 class OdooOAuthProvider:
@@ -333,6 +344,22 @@ class OdooOAuthProvider:
     # ── Access token verification ────────────────────────────────────
 
     async def load_access_token(self, token: str) -> Optional[AccessToken]:
+        # Static-token fallback: accept the configured ODOO_MCP_AUTH_TOKEN
+        # presented directly as a Bearer token, so OAuth clients and simple
+        # fixed-token clients share the same endpoint. Constant-time compare
+        # avoids leaking the secret through timing. The synthetic token never
+        # expires and carries the ``odoo`` scope, mirroring OAuth-issued ones.
+        # Compare as bytes: the token is attacker-controlled and decoded
+        # latin-1 by the transport, so it may hold non-ASCII characters that
+        # would make str-based compare_digest raise instead of just mismatch.
+        if hmac.compare_digest(token.encode("utf-8"), self.auth_token.encode("utf-8")):
+            return AccessToken(
+                token=token,
+                client_id=STATIC_TOKEN_CLIENT_ID,
+                scopes=["odoo"],
+                expires_at=None,
+            )
+
         at = self._access_tokens.get(token)
         if at and at.expires_at and at.expires_at < int(time.time()):
             self._access_tokens.pop(token, None)

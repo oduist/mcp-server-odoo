@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **HTTP auth — OAuth and static Bearer token now work simultaneously**: when OAuth is enabled (`ODOO_MCP_AUTH_TOKEN` + `ODOO_MCP_SERVER_URL`), a client may also present the static `ODOO_MCP_AUTH_TOKEN` directly as an `Authorization: Bearer <token>` header, bypassing the OAuth handshake. OAuth clients (e.g. Claude.ai) and simple fixed-token clients now share the same endpoint. Verification runs through the OAuth provider's `load_access_token` with a constant-time comparison; the static token carries the `odoo` scope and never expires.
+
 ## [0.7.1] - 2026-06-12
 
 ### Added

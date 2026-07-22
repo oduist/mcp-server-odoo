@@ -400,8 +400,12 @@ class OdooMCPServer:
             starlette_app = self.app.streamable_http_app()
 
             if self._oauth_provider:
-                # OAuth handles auth via the SDK's built-in middleware.
-                logger.info("HTTP authentication via OAuth")
+                # OAuth handles auth via the SDK's built-in middleware, which
+                # verifies every Bearer token through the provider's
+                # load_access_token — that also accepts the static auth_token
+                # presented directly, so OAuth and static-token clients work
+                # simultaneously on the same endpoint.
+                logger.info("HTTP authentication via OAuth (static Bearer token also accepted)")
             elif self.config.auth_token:
                 from .http_auth import BearerTokenMiddleware
 
