@@ -261,6 +261,8 @@ docker run --rm -p 8000:8000 \
 
 > ⚠️ **Security**: the HTTP transport has no built-in authentication — anyone who can reach the port gets Odoo access through the server's credentials. Publish the port only on trusted networks, or front it with an authenticating reverse proxy. See [Transport Options](#transport-options).
 
+**Direct Bearer token alongside OAuth.** When OAuth is enabled (`ODOO_MCP_AUTH_TOKEN` + `ODOO_MCP_SERVER_URL`), a client may either run the full OAuth flow **or** send the static `ODOO_MCP_AUTH_TOKEN` directly as an `Authorization: Bearer <token>` header — both are accepted on the same endpoint at once. Use OAuth for clients like Claude.ai, and the direct token for simple scripted clients. (With `ODOO_MCP_AUTH_TOKEN` set but no `ODOO_MCP_SERVER_URL`, only the static Bearer token is used, without OAuth.)
+
 **Persisting OAuth logins across restarts.** When OAuth is enabled (`ODOO_MCP_AUTH_TOKEN` + `ODOO_MCP_SERVER_URL`), the server stores client registrations and access/refresh tokens in memory by default, so **every client must log in again after a restart**. The image persists them to `/data/oauth_state.json` (`ODOO_MCP_OAUTH_STORE_PATH`); mount a **named** volume there to keep them:
 
 ```bash
